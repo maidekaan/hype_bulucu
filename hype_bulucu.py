@@ -201,37 +201,46 @@ def get_okx_swap_tickers():
     return []
 
 
-def get_okx_candles(inst_id: str, bar: str = "1H", limit: int = 24):
-    """İlgili enstrümanın mum verilerini çeker (Freshness Ratio hesabı için)."""
-    url = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
-    try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data.get("code") == "0":
-            return data.get("data", [])
-    except Exception as e:
-        logging.error(f"{inst_id} mum verisi çekilirken hata: {e}")
-    return []
-
-
-def calculate_freshness_ratio(candles):
+def calculate_freshness_ratio(inst_id: str) -> float:
     """
-    Mum verilerine göre Hacim İvmesini hesaplar:
-    Son 4 saatlik ortalama hacim / Önceki 20 saatlik ortalama hacim.
+    Son 60 Günlük (2 Ay) ve Son 2 Saatlik Hacim Kıyaslaması:
+    - Son 60 günün ortalama saatlik hacmini hesaplar.
+    - Son 2 saatin ortalama saatlik hacmini hesaplar.
+    - Hacim İvmesi Katlama Oranını (Freshness Ratio) döndürür.
     """
-    if len(candles) < 24:
-        return 1.0
-
     try:
-        volumes = [float(c[7]) for c in candles[:24]]
-        recent_4h = sum(volumes[:4]) / 4.0
-        older_20h = sum(volumes[4:24]) / 20.0
+        # 1. Son 60 Günün (1D mumu) verisini çek
+        url_60d = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar=1D&limit=60"
+        res_60d = requests.get(url_60d, timeout=10).json()
+        data_60d = res_60d.get("data", [])
 
-        if older_20h == 0:
+        if len(data_60d) < 30:  # Yeterli geçmiş verisi yoksa varsayılan dön
             return 1.0
 
-        return recent_4h / older_20h
-    except Exception:
+        # OKX Candle index 7: volCcy (USDT İşlem Hacmi)
+        total_60d_vol = sum([float(c[7]) for c in data_60d])
+        avg_hourly_vol_60d = (total_60d_vol / len(data_60d)) / 24.0
+
+        # 2. Son 2 Saatlik (1H mumu) veriyi çek
+        url_2h = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar=1H&limit=2"
+        res_2h = requests.get(url_2h, timeout=10).json()
+        data_2h = res_2h.get("data", [])
+
+        if len(data_2h) < 2:
+            return 1.0
+
+        total_2h_vol = sum([float(c[7]) for c in data_2h])
+        avg_hourly_vol_recent = total_2h_vol / 2.0
+
+        # 3. Katlama Hesabı
+        if avg_hourly_vol_60d == 0:
+            return 1.0
+
+        ratio = avg_hourly_vol_recent / avg_hourly_vol_60d
+        return round(ratio, 2)
+
+    except Exception as e:
+        logging.error(f"{inst_id} 60 günlük hacim hesabı hatası: {e}")
         return 1.0
 
 
@@ -267,9 +276,8 @@ def run_scanner():
             power_score = abs(change_24h_pct) * math.log10(turnover_24h)
 
             freshness_ratio = 1.0
-            if power_score > 30.0:  # Mum analiz eşiği
-                candles = get_okx_candles(inst_id, bar="1H", limit=24)
-                freshness_ratio = calculate_freshness_ratio(candles)
+            if power_score > 30.0:  # Mum analiz eşiği geçtiğinde 60 günlük hacim analizi yap
+                freshness_ratio = calculate_freshness_ratio(inst_id)
 
             final_score = power_score * freshness_ratio
 
@@ -317,7 +325,7 @@ def run_scanner():
             msg += f"• Fiyat: `{a['price']}`\n"
             msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
             msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-            msg += f"• Hacim İvmesi (Freshness): `{a['freshness']:.2f}x`\n"
+            msg += f"• Hacim İvmesi (2 Ay Ort. Göre): `{a['freshness']:.2f}x`\n"
             msg += f"• *Final Skor:* `{a['score']:.1f}`\n\n"
 
         send_telegram_alert(msg)
@@ -330,7 +338,7 @@ def run_scanner():
         logging.info("📊 Şu Anki En Yüksek Skorlu 5 Coin:")
         for c in top_candidates:
             logging.info(
-                f"   -> {c['inst_id']:<18} | Değişim: %{c['change_24h_pct']:<6.2f} | Skor: {c['final_score']:.1f}"
+                f"   -> {c['inst_id']:<18} | Değişim: %{c['change_24h_pct']:<6.2f} | 2Ay İvme: {c['freshness_ratio']:<4.2f}x | Skor: {c['final_score']:.1f}"
             )
 
     logging.info("✅ Tarama tamamlandı.")
