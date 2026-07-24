@@ -511,28 +511,29 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Hata ({t.get('symbol')}): {e}")
 
-    # ESKİ KOD (Hata Veren Kısım):
-    # if alerts_to_send:
-    #     msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
-    #     for a in alerts_to_send:
-    #         ...
-    #     send_telegram_alert(msg)
-
-    # YENİ KOD (Her sinyali ayrı mesaj atan güvenli kısım):
     if alerts_to_send:
         for a in alerts_to_send:
             direction = "🟢" if a["change"] >= 0 else "🔴"
+            
+            # OI ve CVD metinlerini hazırlayalım
+            oi_str = f"%{a['oi_change_pct']:.1f}" if a.get("oi_change_pct") is not None else "Veri Yok"
+            cvd_str = f"%{a['cvd_ratio']*100:.0f} Alıcı" if a.get("cvd_ratio") is not None else "Veri Yok"
+            yorum_str = a.get("yorum", "Yorum bulunmuyor.")
+
             msg = (
                 f"🚀 *BYBIT HYPE SINYALI!*\n\n"
                 f"{direction} *{a['inst_id']}*\n"
                 f"• Fiyat: `{a['price']}`\n"
                 f"• 24s Değişim: `%{a['change']:.2f}`\n"
                 f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-                f"• Hacim İvmesi (2 Ay Ort. Göre): `{a['freshness']:.2f}x`\n"
-                f"• *Final Skor:* `{a['score']:.1f}`"
+                f"• Hacim İvmesi: `{a['freshness']:.2f}x`\n"
+                f"• Open Interest (OI): `{oi_str}`\n"
+                f"• CVD (Alış Oranı): `{cvd_str}`\n"
+                f"• *Final Skor:* `{a['score']:.1f}`\n\n"
+                f"💡 *Analiz / Yorum:*\n_{yorum_str}_"
             )
             send_telegram_alert(msg)
-            time.sleep(0.5)  # Telegram API rate limitine takılmamak için mikro es
+            time.sleep(0.5)
 
     top_candidates = sorted(all_results, key=lambda x: x["final_score"], reverse=True)[:5]
     if top_candidates:
