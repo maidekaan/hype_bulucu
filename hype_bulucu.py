@@ -35,6 +35,10 @@ def run_flask():
 # ---------------------------------------------------------------------------
 DB_PATH = "hype_history.db"
 
+# Bybit'in resmi alternatif alan adi -- Render'dan test edilip sorunsuz
+# calistigi kanitlandi (bkz. daha onceki deploy loglari).
+BYBIT_BASE_URL = "https://api.bytick.com"
+
 SCAN_INTERVAL_SECONDS = 900
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -218,42 +222,48 @@ def send_telegram_alert(message: str):
 
 
 # ---------------------------------------------------------------------------
-# OKX BORSASI VERİ ÇEKME VE HESAPLAMA MANTIĞI
+# BYBIT BORSASI VERİ ÇEKME VE HESAPLAMA MANTIĞI
 # ---------------------------------------------------------------------------
 
 
-def get_okx_swap_tickers():
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
+def get_bybit_tickers():
+    """
+    Bybit'in TUM linear (USDT vadeli islem) coinlerinin 24s ozetini TEK
+    istekte ceker. OKX'ten farkli olarak Bybit'in ticker cevabi Open
+    Interest'i de ICINDE veriyor -- ayri bir OI istegi hic gerekmiyor.
+    """
+    url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, params={"category": "linear"}, timeout=15)
         data = response.json()
-        if data.get("code") == "0":
-            return data.get("data", [])
+        if data.get("retCode") == 0:
+            return data.get("result", {}).get("list", [])
+        else:
+            logging.error(f"Bybit Tickers API hatasi: {data.get('retMsg')}")
     except Exception as e:
-        logging.error(f"OKX Tickers çekilirken hata: {e}")
+        logging.error(f"Bybit Tickers çekilirken hata: {e}")
     return []
 
 
-def get_all_open_interest():
+def get_all_open_interest(tickers):
     """
-    TUM SWAP enstrumanlarinin Open Interest'ini TEK istekte ceker.
-    Donus: {instId: oi_degeri} seklinde sozluk.
+    Bybit'te OI, ticker cevabinin ICINDE zaten geliyor -- OKX'teki gibi
+    AYRI bir istek yapmaya gerek yok. Bu fonksiyon sadece zaten elimizde
+    olan ticker listesinden OI degerlerini cikarip sozluk haline getirir
+    (kod akisini ve log mesajlarini eskisiyle tutarli tutmak icin ayri
+    fonksiyon olarak birakildi).
+    Donus: {symbol: oi_degeri} seklinde sozluk.
     """
-    url = "https://www.okx.com/api/v5/public/open-interest?instType=SWAP"
-    try:
-        response = requests.get(url, timeout=15)
-        data = response.json()
-        if data.get("code") == "0":
-            result = {}
-            for item in data.get("data", []):
-                try:
-                    result[item["instId"]] = float(item.get("oiCcy") or item.get("oi") or 0)
-                except (TypeError, ValueError):
-                    continue
-            return result
-    except Exception as e:
-        logging.error(f"OKX Open Interest çekilirken hata: {e}")
-    return {}
+    result = {}
+    for item in tickers:
+        try:
+            symbol = item.get("symbol")
+            oi_value = float(item.get("openInterestValue") or item.get("openInterest") or 0)
+            if symbol:
+                result[symbol] = oi_value
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
@@ -262,17 +272,19 @@ def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
     oldugunu hesaplar. 0.5 dengeli, 1.0'a yaklastikca alis baskisi agir basar.
     Sadece kisa listeye giren (esigi gecen) adaylar icin cagrilir.
     """
-    url = f"https://www.okx.com/api/v5/market/trades?instId={inst_id}&limit={limit}"
+    url = f"{BYBIT_BASE_URL}/v5/market/recent-trade"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(
+            url, params={"category": "linear", "symbol": inst_id, "limit": limit}, timeout=10
+        )
         data = response.json()
-        if data.get("code") != "0":
+        if data.get("retCode") != 0:
             return None
-        trades = data.get("data", [])
+        trades = data.get("result", {}).get("list", [])
         if not trades:
             return None
-        buy_vol = sum(float(t["sz"]) for t in trades if t.get("side") == "buy")
-        sell_vol = sum(float(t["sz"]) for t in trades if t.get("side") == "sell")
+        buy_vol = sum(float(t["size"]) for t in trades if t.get("side") == "Buy")
+        sell_vol = sum(float(t["size"]) for t in trades if t.get("side") == "Sell")
         total = buy_vol + sell_vol
         if total == 0:
             return None
@@ -285,27 +297,34 @@ def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
 def calculate_freshness_ratio(inst_id: str) -> float:
     """
     Son 60 Günlük (2 Ay) ve Son 2 Saatlik Hacim Kıyaslaması.
-    (Bu fonksiyona dokunulmadi, oldugu gibi korundu.)
+    (Mantik degismedi, sadece veri kaynagi Bybit'e cevrildi.)
     """
     try:
-        url_60d = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar=1D&limit=60"
-        res_60d = requests.get(url_60d, timeout=10).json()
-        data_60d = res_60d.get("data", [])
+        url_60d = f"{BYBIT_BASE_URL}/v5/market/kline"
+        res_60d = requests.get(
+            url_60d, params={"category": "linear", "symbol": inst_id, "interval": "D", "limit": 60},
+            timeout=10,
+        ).json()
+        data_60d = res_60d.get("result", {}).get("list", [])
 
         if len(data_60d) < 30:
             return 1.0
 
-        total_60d_vol = sum([float(c[7]) for c in data_60d])
+        # Bybit kline formati: [start, open, high, low, close, volume, turnover]
+        total_60d_vol = sum([float(c[6]) for c in data_60d])
         avg_hourly_vol_60d = (total_60d_vol / len(data_60d)) / 24.0
 
-        url_2h = f"https://www.okx.com/api/v5/market/candles?instId={inst_id}&bar=1H&limit=2"
-        res_2h = requests.get(url_2h, timeout=10).json()
-        data_2h = res_2h.get("data", [])
+        url_2h = f"{BYBIT_BASE_URL}/v5/market/kline"
+        res_2h = requests.get(
+            url_2h, params={"category": "linear", "symbol": inst_id, "interval": "60", "limit": 2},
+            timeout=10,
+        ).json()
+        data_2h = res_2h.get("result", {}).get("list", [])
 
         if len(data_2h) < 2:
             return 1.0
 
-        total_2h_vol = sum([float(c[7]) for c in data_2h])
+        total_2h_vol = sum([float(c[6]) for c in data_2h])
         avg_hourly_vol_recent = total_2h_vol / 2.0
 
         if avg_hourly_vol_60d == 0:
@@ -386,16 +405,17 @@ def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range,
 
 def run_scanner():
     """Ana piyasa tarama ve hesaplama döngüsü."""
-    logging.info("🔍 OKX Hype taraması başlatılıyor...")
+    logging.info("🔍 Bybit Hype taraması başlatılıyor...")
     logging.info(f"[Ayar Kontrolu] TELEGRAM_BOT_TOKEN tanimli mi: {bool(TELEGRAM_BOT_TOKEN)}")
     logging.info(f"[Ayar Kontrolu] TELEGRAM_CHAT_ID tanimli mi: {bool(TELEGRAM_CHAT_ID)}")
 
-    tickers = get_okx_swap_tickers()
+    tickers = get_bybit_tickers()
     if not tickers:
-        logging.warning("OKX'ten ticker verisi alınamadı.")
+        logging.warning("Bybit'ten ticker verisi alınamadı.")
         return
 
-    oi_map = get_all_open_interest()
+    # Bybit'te OI ayri istek gerektirmiyor, ticker cevabinin icinden cikariyoruz.
+    oi_map = get_all_open_interest(tickers)
     logging.info(f"[OI] {len(oi_map)} enstruman icin Open Interest verisi alindi.")
 
     alerts_to_send = []
@@ -403,20 +423,20 @@ def run_scanner():
 
     for t in tickers:
         try:
-            inst_id = t.get("instId", "")
-            if not inst_id.endswith("-USDT-SWAP"):
+            inst_id = t.get("symbol", "")
+            if not inst_id.endswith("USDT"):
                 continue
 
-            last_price = float(t.get("last", 0))
-            open_24h = float(t.get("sodUtc0", t.get("open24h", last_price)))
-            high_24h = float(t.get("high24h", last_price))
-            low_24h = float(t.get("low24h", last_price))
+            last_price = float(t.get("lastPrice", 0))
+            open_24h = float(t.get("prevPrice24h", last_price))
+            high_24h = float(t.get("highPrice24h", last_price))
+            low_24h = float(t.get("lowPrice24h", last_price))
 
             if open_24h == 0:
                 continue
 
             change_24h_pct = ((last_price - open_24h) / open_24h) * 100.0
-            turnover_24h = float(t.get("volCcy24h", 0))
+            turnover_24h = float(t.get("turnover24h", 0))
 
             if turnover_24h < MIN_TURNOVER_24H:
                 continue
@@ -489,7 +509,7 @@ def run_scanner():
             record_observation(obs_data)
 
         except Exception as e:
-            logging.error(f"Hata ({t.get('instId')}): {e}")
+            logging.error(f"Hata ({t.get('symbol')}): {e}")
 
     if alerts_to_send:
         msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
@@ -535,12 +555,12 @@ def main_loop():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="OKX Hype Bulucu Bot ve Veritabanı Sorgulayıcı"
+        description="Bybit Hype Bulucu Bot ve Veritabanı Sorgulayıcı"
     )
     parser.add_argument(
         "--gecmis",
         type=str,
-        help="Belirtilen sembolün geçmiş veritabanı kayıtlarını gösterir. Örn: ONDO-USDT-SWAP",
+        help="Belirtilen sembolün geçmiş veritabanı kayıtlarını gösterir. Örn: ONDOUSDT",
     )
 
     args = parser.parse_args()
