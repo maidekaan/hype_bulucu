@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 import requests
-from flask import Flask
+from flask import Flask, request
 
 # ---------------------------------------------------------------------------
 # RENDER + UPTIME INTEGRATION (Flask Web Server)
@@ -22,6 +22,258 @@ cli.setLevel(logging.ERROR)
 def health_check():
     """UptimeRobot ve Render sağlık kontrolü için yanıt veren uç nokta."""
     return "OK - Hype Bulucu Bot Aktif ve Calisiyor!", 200
+
+
+# ---------------------------------------------------------------------------
+# HIZLI TEKNIK OZET ARACI (/analiz sayfasi)
+# ---------------------------------------------------------------------------
+# Bu bolum, ana tarama motoruna (run_scanner, main_loop) HICBIR sekilde
+# dokunmaz -- sadece ayni Flask sunucusuna EK bir sayfa ekler. Telefondan
+# https://senin-render-adresin.onrender.com/analiz adresini acip coin
+# yazarak calistirilir.
+
+def calculate_sma(closes, period):
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def calculate_rsi(closes, period=14):
+    """Standart Wilder RSI. closes KRONOLOJIK sirada (en eski once) olmali."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_gain == 0 and avg_loss == 0:
+        return 50.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _ema_series(values, period):
+    k = 2 / (period + 1)
+    ema_values = [values[0]]
+    for v in values[1:]:
+        ema_values.append(v * k + ema_values[-1] * (1 - k))
+    return ema_values
+
+
+def calculate_macd(closes, fast=12, slow=26, signal=9):
+    """closes KRONOLOJIK sirada olmali."""
+    if len(closes) < slow + signal:
+        return None
+    ema_fast = _ema_series(closes, fast)
+    ema_slow = _ema_series(closes, slow)
+    macd_line_series = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line_series = _ema_series(macd_line_series, signal)
+    macd_line = macd_line_series[-1]
+    signal_line = signal_line_series[-1]
+    histogram = macd_line - signal_line
+    prev_histogram = (
+        macd_line_series[-2] - signal_line_series[-2] if len(macd_line_series) > 1 else histogram
+    )
+    return {"macd": macd_line, "signal": signal_line, "histogram": histogram, "prev_histogram": prev_histogram}
+
+
+def calculate_atr(highs, lows, closes, period=14):
+    """closes/highs/lows KRONOLOJIK sirada olmali."""
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    return sum(trs[-period:]) / period
+
+
+def find_support_resistance(highs, lows, lookback=30):
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    recent_highs = highs[-lookback:]
+    recent_lows = lows[-lookback:]
+    return {"resistance": max(recent_highs), "support": min(recent_lows)}
+
+
+def fetch_daily_klines(symbol: str, limit: int = 250):
+    """
+    Bybit'ten gunluk mum verisi ceker, KRONOLOJIK (en eski once) sirada
+    dondurur -- Bybit API'si aksi yonde (en yeni once) verdigi icin ters
+    ceviriyoruz.
+    Donus: (closes, highs, lows) listeleri, hepsi ayni sirada.
+    """
+    url = f"{BYBIT_BASE_URL}/v5/market/kline"
+    r = requests.get(
+        url, params={"category": "linear", "symbol": symbol, "interval": "D", "limit": limit},
+        timeout=10,
+    )
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(data.get("retMsg", "Bybit API hatasi"))
+    raw = data.get("result", {}).get("list", [])
+    if not raw:
+        raise RuntimeError(f"'{symbol}' icin veri bulunamadi -- sembol adini kontrol et (orn BTCUSDT).")
+    raw = list(reversed(raw))  # kronolojik siraya cevir
+    closes = [float(c[4]) for c in raw]
+    highs = [float(c[2]) for c in raw]
+    lows = [float(c[3]) for c in raw]
+    return closes, highs, lows
+
+
+def generate_technical_summary(symbol: str):
+    """
+    Bir coin icin RSI/MA/MACD/ATR/destek-direnc hesaplayip okunabilir bir
+    Turkce ozet uretir. Bu bir tahmin/tavsiye/TP hedefi DEGILDIR -- sadece
+    mevcut teknik durumun okunabilir bir ozetidir, karar tamamen kullanicinin.
+    """
+    closes, highs, lows = fetch_daily_klines(symbol)
+    last_price = closes[-1]
+
+    rsi = calculate_rsi(closes)
+    ma20 = calculate_sma(closes, 20)
+    ma50 = calculate_sma(closes, 50)
+    ma200 = calculate_sma(closes, 200)
+    macd = calculate_macd(closes)
+    atr = calculate_atr(highs, lows, closes)
+    levels = find_support_resistance(highs, lows, lookback=30)
+
+    notlar = []
+
+    # RSI yorumu
+    if rsi is not None:
+        if rsi >= 70:
+            notlar.append(f"RSI {rsi:.0f} -- aşırı alım bölgesinde, kısa vadeli geri çekilme riski artmış olabilir.")
+        elif rsi <= 30:
+            notlar.append(f"RSI {rsi:.0f} -- aşırı satım bölgesinde, tepki yükselişi görülebilir.")
+        else:
+            notlar.append(f"RSI {rsi:.0f} -- nötr bölgede, belirgin bir aşırılık yok.")
+
+    # MA (trend) yorumu
+    if ma20 and ma50 and ma200:
+        if last_price > ma20 > ma50 > ma200:
+            notlar.append("Fiyat MA20/MA50/MA200'ün üzerinde ve sıralama yükseliş trendine işaret ediyor (güçlü trend).")
+        elif last_price < ma20 < ma50 < ma200:
+            notlar.append("Fiyat MA20/MA50/MA200'ün altında ve sıralama düşüş trendine işaret ediyor (zayıf trend).")
+        elif last_price > ma200:
+            notlar.append("Fiyat uzun vadeli ortalamanın (MA200) üzerinde ama kısa vadeli ortalamalarla karışık -- net bir trend yok.")
+        else:
+            notlar.append("Fiyat uzun vadeli ortalamanın (MA200) altında, genel görünüm zayıf.")
+
+    # MACD yorumu
+    if macd:
+        if macd["histogram"] > 0 and macd["prev_histogram"] <= 0:
+            notlar.append("MACD az önce pozitif kesişim yaptı -- yükseliş momentumu yeni başlıyor olabilir.")
+        elif macd["histogram"] < 0 and macd["prev_histogram"] >= 0:
+            notlar.append("MACD az önce negatif kesişim yaptı -- düşüş momentumu yeni başlıyor olabilir.")
+        elif macd["histogram"] > 0:
+            notlar.append("MACD pozitif -- yükseliş momentumu devam ediyor.")
+        else:
+            notlar.append("MACD negatif -- düşüş momentumu devam ediyor.")
+
+    # Destek/Direnç + ATR (volatilite bandı)
+    if levels:
+        dist_to_resistance = (levels["resistance"] - last_price) / last_price * 100
+        dist_to_support = (last_price - levels["support"]) / last_price * 100
+        notlar.append(
+            f"Son 30 günün direnci ~{levels['resistance']:.6g} (fiyatın %{dist_to_resistance:.1f} üzerinde), "
+            f"desteği ~{levels['support']:.6g} (fiyatın %{dist_to_support:.1f} altında)."
+        )
+    if atr:
+        atr_pct = atr / last_price * 100
+        notlar.append(f"Ortalama günlük volatilite (ATR): ~%{atr_pct:.1f} -- bu, günlük 'normal' dalgalanma büyüklüğü.")
+
+    return {
+        "symbol": symbol,
+        "last_price": last_price,
+        "rsi": rsi,
+        "ma20": ma20,
+        "ma50": ma50,
+        "ma200": ma200,
+        "macd": macd,
+        "atr": atr,
+        "levels": levels,
+        "notlar": notlar,
+    }
+
+
+ANALIZ_SAYFA_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hizli Teknik Ozet</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f14; color:#e6edf3; margin:0; padding:16px; }}
+  h1 {{ font-size: 20px; }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:14px 16px; margin-bottom:12px; }}
+  input[type=text] {{ background:#0d1117; border:1px solid #30363d; color:#e6edf3; padding:10px; border-radius:8px; font-size:16px; width:60%; }}
+  button {{ background:#238636; color:white; border:none; padding:10px 18px; border-radius:8px; font-size:16px; }}
+  .row {{ display:flex; justify-content:space-between; padding:4px 0; font-size:14px; }}
+  .label {{ color:#8b949e; }}
+  .err {{ color:#f85149; }}
+  .not-item {{ font-size:14px; margin:6px 0; line-height:1.5; }}
+  .disclaimer {{ color:#8b949e; font-size:12px; margin-top:16px; }}
+</style>
+</head>
+<body>
+  <h1>🔍 Hizli Teknik Ozet</h1>
+  <form method="get" action="/analiz">
+    <input type="text" name="symbol" placeholder="orn BTCUSDT" value="{symbol_value}">
+    <button type="submit">Incele</button>
+  </form>
+  <div style="margin-top:16px;">
+  {results}
+  </div>
+  <div class="disclaimer">
+    Bu sayfa yatirim tavsiyesi degildir, sadece teknik gostergelerin okunabilir
+    bir ozetidir. Karar tamamen sanadir.
+  </div>
+</body>
+</html>
+"""
+
+
+@app.route("/analiz")
+def analiz_page():
+    symbol = request.args.get("symbol", "").strip().upper()
+    results_html = ""
+
+    if symbol:
+        try:
+            r = generate_technical_summary(symbol)
+            notlar_html = "".join(f'<div class="not-item">• {n}</div>' for n in r["notlar"])
+            results_html = f"""
+            <div class="card">
+              <div class="row"><span class="label">Sembol</span><span>{r['symbol']}</span></div>
+              <div class="row"><span class="label">Guncel Fiyat</span><span>{r['last_price']}</span></div>
+              <div class="row"><span class="label">RSI (14)</span><span>{r['rsi']:.1f}</span></div>
+              <div class="row"><span class="label">MA20 / MA50 / MA200</span><span>{r['ma20']:.6g} / {r['ma50']:.6g} / {r['ma200']:.6g}</span></div>
+              <div class="row"><span class="label">MACD Histogram</span><span>{r['macd']['histogram']:.6g}</span></div>
+            </div>
+            <div class="card">
+              <b>Teknik Ozet:</b>
+              {notlar_html}
+            </div>
+            """
+        except Exception as e:
+            results_html = f'<div class="card err">Hata: {e}</div>'
+
+    return ANALIZ_SAYFA_TEMPLATE.format(symbol_value=symbol, results=results_html)
 
 
 def run_flask():
@@ -512,28 +764,22 @@ def run_scanner():
             logging.error(f"Hata ({t.get('symbol')}): {e}")
 
     if alerts_to_send:
+        msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
         for a in alerts_to_send:
             direction = "🟢" if a["change"] >= 0 else "🔴"
-            
-            # OI ve CVD metinlerini hazırlayalım
-            oi_str = f"%{a['oi_change_pct']:.1f}" if a.get("oi_change_pct") is not None else "Veri Yok"
-            cvd_str = f"%{a['cvd_ratio']*100:.0f} Alıcı" if a.get("cvd_ratio") is not None else "Veri Yok"
-            yorum_str = a.get("yorum", "Yorum bulunmuyor.")
+            msg += f"{direction} *{a['inst_id']}*\n"
+            msg += f"• Fiyat: `{a['price']}`\n"
+            msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
+            msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
+            msg += f"• Hacim İvmesi: `{a['freshness']:.2f}x`\n"
+            if a["oi_change_pct"] is not None:
+                msg += f"• OI Değişimi (24s): `%{a['oi_change_pct']:.1f}`\n"
+            if a["cvd_ratio"] is not None:
+                msg += f"• Alış Oranı (CVD): `%{a['cvd_ratio']*100:.0f}`\n"
+            msg += f"• *Final Skor:* `{a['score']:.1f}`\n"
+            msg += f"📝 _{a['yorum']}_\n\n"
 
-            msg = (
-                f"🚀 *BYBIT HYPE SINYALI!*\n\n"
-                f"{direction} *{a['inst_id']}*\n"
-                f"• Fiyat: `{a['price']}`\n"
-                f"• 24s Değişim: `%{a['change']:.2f}`\n"
-                f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-                f"• Hacim İvmesi: `{a['freshness']:.2f}x`\n"
-                f"• Open Interest (OI): `{oi_str}`\n"
-                f"• CVD (Alış Oranı): `{cvd_str}`\n"
-                f"• *Final Skor:* `{a['score']:.1f}`\n\n"
-                f"💡 *Analiz / Yorum:*\n_{yorum_str}_"
-            )
-            send_telegram_alert(msg)
-            time.sleep(0.5)
+        send_telegram_alert(msg)
 
     top_candidates = sorted(all_results, key=lambda x: x["final_score"], reverse=True)[:5]
     if top_candidates:
