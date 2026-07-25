@@ -207,7 +207,7 @@ def get_coingecko_market_data(symbol: str):
         return None
     try:
         search_url = "https://api.coingecko.com/api/v3/search"
-        r = requests.get(search_url, params={"query": base}, timeout=8)
+        r = requests.get(search_url, params={"query": base}, headers=COINGECKO_HEADERS, timeout=8)
         data = r.json()
         coins = data.get("coins", [])
         # Sembolu TAM eslesen ilk sonucu tercih et (en alakali coin genelde
@@ -225,6 +225,7 @@ def get_coingecko_market_data(symbol: str):
             detail_url,
             params={"localization": "false", "tickers": "false", "market_data": "true",
                     "community_data": "false", "developer_data": "false"},
+            headers=COINGECKO_HEADERS,
             timeout=8,
         )
         detail = r2.json()
@@ -237,6 +238,43 @@ def get_coingecko_market_data(symbol: str):
         return {"market_cap": market_cap, "circulating_supply": circulating, "rank": rank, "coingecko_id": coin_id}
     except Exception:
         return None
+
+
+_trending_cache = {"symbols": set(), "fetched_at": 0}
+
+
+def get_coingecko_trending(cache_seconds: int = 600):
+    """
+    CoinGecko'da son 24 saatte en cok ARANAN (trend olan) coinlerin
+    sembol listesini ceker (buyuk harfle, orn {'BTC','PEPE',...}).
+    Bu, "gercekten hype yapan" coinleri, sadece bizim hacim taramamiza
+    degil, CoinGecko'nun kendi arama verisine gore de TEYIT etmemizi saglar.
+
+    Kucuk bir cache var (varsayilan 10 dakika) -- her tarama turunda
+    gereksiz yere ayni istegi tekrar tekrar atmamak icin.
+    """
+    now = time.time()
+    if now - _trending_cache["fetched_at"] < cache_seconds and _trending_cache["symbols"]:
+        return _trending_cache["symbols"]
+
+    try:
+        url = "https://api.coingecko.com/api/v3/search/trending"
+        r = requests.get(url, headers=COINGECKO_HEADERS, timeout=8)
+        data = r.json()
+        coins = data.get("coins", [])
+        symbols = set()
+        for c in coins:
+            item = c.get("item", {})
+            sym = item.get("symbol", "").upper()
+            if sym:
+                symbols.add(sym)
+        if symbols:
+            _trending_cache["symbols"] = symbols
+            _trending_cache["fetched_at"] = now
+        return symbols
+    except Exception as e:
+        logging.error(f"[CoinGecko Trending] hata: {e}")
+        return _trending_cache["symbols"]  # basarisiz olursa eski (varsa) veriyi kullan
 
 
 def generate_technical_summary(symbol: str):
@@ -276,6 +314,12 @@ def generate_technical_summary(symbol: str):
         market_data = get_coingecko_market_data(symbol)
     except Exception:
         market_data = None
+    try:
+        trending_symbols = get_coingecko_trending()
+        base_symbol = symbol.replace("USDT", "").strip().upper()
+        is_trending = base_symbol in trending_symbols
+    except Exception:
+        is_trending = False
 
     notlar = []
 
@@ -351,6 +395,10 @@ def generate_technical_summary(symbol: str):
         rank_str = f" (piyasa değeri sıralaması: #{market_data['rank']})" if market_data.get("rank") else ""
         notlar.append(f"Market cap: ~${market_data['market_cap']:,.0f}{rank_str}.")
 
+    if is_trending:
+        notlar.append("🔥 Bu coin şu anda CoinGecko'nun 'Trending' (en çok aranan) listesinde -- "
+                      "hem hacim hem genel arama ilgisi aynı anda yükseliyor, bu çapraz teyit güçlü bir sinyal.")
+
     return {
         "symbol": symbol,
         "last_price": last_price,
@@ -366,6 +414,7 @@ def generate_technical_summary(symbol: str):
         "funding_rate": funding_rate,
         "long_short": long_short,
         "market_data": market_data,
+        "is_trending": is_trending,
         "notlar": notlar,
     }
 
@@ -439,6 +488,10 @@ def analiz_page():
             if r.get("market_data") is not None:
                 mcap_row = f'<div class="row"><span class="label">Market Cap</span><span>${r["market_data"]["market_cap"]:,.0f}</span></div>'
 
+            trending_row = ""
+            if r.get("is_trending"):
+                trending_row = '<div class="row"><span class="label">CoinGecko Trending</span><span>🔥 EVET</span></div>'
+
             results_html = f"""
             <div class="card">
               <div class="row"><span class="label">Sembol</span><span>{r['symbol']}</span></div>
@@ -451,6 +504,7 @@ def analiz_page():
               {funding_row}
               {ls_row}
               {mcap_row}
+              {trending_row}
             </div>
             <div class="card">
               <b>Teknik Ozet:</b>
@@ -592,6 +646,12 @@ BYBIT_BASE_URL = "https://api.bytick.com"
 # gizli degerini belirlemen onerilir -- tanimlamazsan varsayilan kullanilir
 # (herkese acik URL oldugu icin bunu degistirmen guvenlik acisindan iyi olur).
 SEED_SECRET_KEY = os.environ.get("SEED_SECRET_KEY", "degistir-bu-anahtari")
+
+# CoinGecko Demo API Key -- market cap ve trending ozellikleri icin.
+# 2026'da CoinGecko ucretsiz kullanim icin bile bu key'i zorunlu kildi.
+# Render'da Environment Variable olarak COINGECKO_API_KEY tanimlaman gerekiyor.
+COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
+COINGECKO_HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
 
 SCAN_INTERVAL_SECONDS = 900
 
@@ -1030,6 +1090,15 @@ def run_scanner():
     oi_map = get_all_open_interest(tickers)
     logging.info(f"[OI] {len(oi_map)} enstruman icin Open Interest verisi alindi.")
 
+    # CoinGecko Trending listesini TEK istekte cek (cache'li, her tarama
+    # turunda yeniden istek atmiyor -- 10 dakikada bir yenileniyor).
+    try:
+        trending_symbols = get_coingecko_trending()
+        logging.info(f"[CoinGecko] Trending listesi: {len(trending_symbols)} sembol.")
+    except Exception as e:
+        logging.error(f"[CoinGecko] Trending listesi alinamadi: {e}")
+        trending_symbols = set()
+
     alerts_to_send = []
     all_results = []
 
@@ -1115,6 +1184,16 @@ def run_scanner():
                 yorum = generate_commentary(
                     change_24h_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio
                 )
+
+                # CoinGecko Trending ile capraz teyit -- bu coin hem bizim
+                # hacim taramamizda HEM CoinGecko'nun kendi arama trendinde
+                # cikiyorsa, bu guclu bir capraz dogrulamadir.
+                base_symbol = inst_id.replace("USDT", "").strip().upper()
+                is_trending = base_symbol in trending_symbols
+                if is_trending:
+                    yorum += (" 🔥 Ayrica CoinGecko'nun Trending (en cok aranan) listesinde de var -- "
+                              "hem hacim hem genel arama ilgisi ayni anda yukseliyor, capraz teyit guclu.")
+
                 obs_data["yorum"] = yorum
                 obs_data["notified"] = 1
 
