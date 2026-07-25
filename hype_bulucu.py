@@ -408,6 +408,11 @@ SEED_SECRET_KEY = os.environ.get("SEED_SECRET_KEY", "degistir-bu-anahtari")
 
 SCAN_INTERVAL_SECONDS = 900
 
+# --- 4 saatlik ozet raporu ayarlari ---
+REPORT_INTERVAL_SECONDS = 4 * 3600     # her 4 saatte bir ozet raporu gonder
+REPORT_MIN_MOVE_PCT = 10.0              # rapora girecek min. 4 saatlik hareket yuzdesi
+REPORT_MAX_ITEMS_SHOWN = 15             # mesajda en fazla kac coin listelenecek (uzun mesaj limiti icin)
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -982,13 +987,97 @@ def run_scanner():
     logging.info("✅ Tarama tamamlandı.")
 
 
+# ---------------------------------------------------------------------------
+# 4 SAATLIK OZET RAPORU
+# ---------------------------------------------------------------------------
+# Bu bolum run_scanner()'a HICBIR sekilde dokunmaz -- sadece zaten biriken
+# veriyi (her taramada TUM taranan coinler icin kaydedilen fiyat/notified
+# bilgisi) okuyup periyodik bir ozet Telegram mesaji uretir.
+
+def generate_4h_report():
+    """
+    Son ~4 saatte biriken gozlemlerden, her coin icin O PENCEREDEKI ilk ve
+    son fiyati kiyaslayarak GERCEK 4 saatlik fiyat degisimini hesaplar
+    (Bybit'in kendi '24s degisim' alanindan FARKLI bir hesap -- bu bizim
+    kendi biriktirdigimiz veriden, tam 4 saatlik pencere icin).
+    Ayrica o coin icin bu pencerede alarm verilip verilmedigini (notified)
+    kontrol eder.
+    Donus: buyukten kucuge siralanmis mover listesi.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    since_ts = (datetime.now(timezone.utc) - timedelta(hours=4, minutes=15)).isoformat()
+    cursor.execute(
+        """
+        SELECT inst_id, timestamp, last_price, notified FROM hype_observations
+        WHERE timestamp >= ? ORDER BY inst_id, timestamp ASC
+        """,
+        (since_ts,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    by_symbol = {}
+    for inst_id, ts, price, notified in rows:
+        if not price:
+            continue
+        if inst_id not in by_symbol:
+            by_symbol[inst_id] = {"first_price": price, "last_price": price, "was_notified": bool(notified)}
+        else:
+            by_symbol[inst_id]["last_price"] = price
+            if notified:
+                by_symbol[inst_id]["was_notified"] = True
+
+    movers = []
+    for symbol, d in by_symbol.items():
+        if d["first_price"] and d["first_price"] > 0:
+            pct = (d["last_price"] - d["first_price"]) / d["first_price"] * 100.0
+            if abs(pct) >= REPORT_MIN_MOVE_PCT:
+                movers.append({"symbol": symbol, "pct": pct, "caught": d["was_notified"]})
+
+    movers.sort(key=lambda x: -abs(x["pct"]))
+    return movers
+
+
+def send_4h_report():
+    """4 saatlik ozet raporunu Telegram'a gonderir."""
+    movers = generate_4h_report()
+    total = len(movers)
+    caught = sum(1 for m in movers if m["caught"])
+
+    msg = "📊 *4 SAATLIK OZET RAPORU*\n\n"
+    if total == 0:
+        msg += f"Son 4 saatte %{REPORT_MIN_MOVE_PCT:.0f}+ hareket eden coin olmadi (ya da yeterli veri yok)."
+    else:
+        msg += f"Son 4 saatte %{REPORT_MIN_MOVE_PCT:.0f}+ hareket eden coin sayisi: *{total}*\n"
+        msg += f"Sistemin yakaladigi (alarm verdigi): *{caught}/{total}*\n\n"
+        for m in movers[:REPORT_MAX_ITEMS_SHOWN]:
+            tag = "✅" if m["caught"] else "❌"
+            direction = "🟢" if m["pct"] >= 0 else "🔴"
+            msg += f"{tag}{direction} {m['symbol']}: %{m['pct']:.1f}\n"
+        if total > REPORT_MAX_ITEMS_SHOWN:
+            msg += f"\n... ve {total - REPORT_MAX_ITEMS_SHOWN} coin daha (mesaj uzunlugu siniri)."
+
+    send_telegram_alert(msg)
+    logging.info(f"[Rapor] 4 saatlik ozet gonderildi. {total} hareketli coin, {caught} tanesi yakalanmisti.")
+
+
 def main_loop():
     init_db()
+    last_report_ts = time.time()  # ilk rapor, deploy'dan 4 saat sonra gonderilir
     while True:
         try:
             run_scanner()
         except Exception as e:
             logging.error(f"Ana döngüde beklenmeyen hata: {e}")
+
+        now = time.time()
+        if now - last_report_ts >= REPORT_INTERVAL_SECONDS:
+            try:
+                send_4h_report()
+            except Exception as e:
+                logging.error(f"4 saatlik rapor gonderilirken hata: {e}")
+            last_report_ts = now
 
         time.sleep(SCAN_INTERVAL_SECONDS)
 
