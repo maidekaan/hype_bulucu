@@ -297,7 +297,25 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MIN_TURNOVER_24H = 300_000.0
-ALERT_POWER_SCORE_THRESHOLD = 60.0
+
+# --- YENI FORMUL: HACIM ANA BELIRLEYICI, FIYAT DEGISIMI IKINCIL/TEYIT EDICI ---
+# Eskiden: power_score = |fiyat_degisimi| * log10(hacim)  -- fiyat agirlikliydi.
+# Simdi:   power_score = hacim_orani * (1 + |fiyat_degisimi|/100)
+# hacim_orani = bu coinin GUNCEL cirosu / KENDI GECMIS ORTALAMA cirosu.
+# Bu, "coin normalin kac kati hacim goruyor" sorusuna cevap veriyor -- BTC/ETH
+# gibi zaten hacimli coinlerin sirf buyuk olduklari icin one cikmasini onluyor,
+# cunku artik mutlak hacim degil, KENDI NORMALINE GORE oran onemli.
+BASELINE_MIN_SAMPLES = 20          # bu kadar gecmis kayit yoksa 'yetersiz veri' sayilir, alarm verilmez
+BASELINE_EXCLUDE_RECENT_HOURS = 2.0  # son X saat baseline'a DAHIL EDILMEZ (guncel spike kendi
+                                      # baseline'ini kirletmesin diye -- backtest.py'deki ayni prensip)
+FRESHNESS_CHECK_VOLUME_RATIO = 2.5   # hacim orani bu degeri gecince (ekstra API cagrisi gerektiren)
+                                       # tazelik kontrolu calistirilir
+
+# NOT: Skor olcegi tamamen degisti (eskiden 60-2000 araligindaydi, simdi
+# tipik olarak 1-30 araliginda olacak). Bu esik BASLANGIC degeridir --
+# birkac gunluk gercek veriyle (Telegram/veritabani) kalibre edilmesi onerilir.
+ALERT_POWER_SCORE_THRESHOLD = 6.0
+
 ALERT_COOLDOWN_HOURS = 6.0
 
 # --- YENI: OI / CVD / Tukenme kontrolu icin esikler ---
@@ -348,6 +366,7 @@ def init_db():
         "cvd_buy_ratio REAL",
         "position_in_range REAL",
         "yorum TEXT",
+        "volume_ratio REAL",
     ]:
         try:
             cursor.execute(f"ALTER TABLE hype_observations ADD COLUMN {col_def}")
@@ -366,8 +385,9 @@ def record_observation(data: dict):
         INSERT INTO hype_observations (
             timestamp, inst_id, last_price, change_24h_pct, turnover_24h,
             power_score, freshness_ratio, final_score, notified,
-            oi_value, oi_change_pct, cvd_buy_ratio, position_in_range, yorum
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            oi_value, oi_change_pct, cvd_buy_ratio, position_in_range, yorum,
+            volume_ratio
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             data["timestamp"],
@@ -384,6 +404,7 @@ def record_observation(data: dict):
             data.get("cvd_buy_ratio"),
             data.get("position_in_range"),
             data.get("yorum"),
+            data.get("volume_ratio"),
         ),
     )
     conn.commit()
@@ -429,13 +450,45 @@ def get_previous_oi(inst_id: str):
     return row[0] if row and row[0] else None
 
 
+def get_average_turnover(inst_id: str):
+    """
+    Bu coin icin KENDI GECMISINDEKI ortalama 24s ciroyu hesaplar -- yeni
+    hacim-odakli formulun temeli. Guncel spike'in kendi baseline'ini
+    kirletmemesi icin son BASELINE_EXCLUDE_RECENT_HOURS saat DISLANIR
+    (backtest.py'de kullandigimiz ayni prensip).
+
+    Yeterli gecmis (en az BASELINE_MIN_SAMPLES kayit) yoksa None doner --
+    bu durumda bu coin icin guvenilir bir hacim orani hesaplanamaz ve
+    coin alarma dahil edilmez (yanlis pozitif riskini onlemek icin).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=BASELINE_EXCLUDE_RECENT_HOURS)
+    ).isoformat()
+    cursor.execute(
+        """
+        SELECT turnover_24h FROM hype_observations
+        WHERE inst_id = ? AND turnover_24h IS NOT NULL AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 200
+    """,
+        (inst_id, cutoff),
+    )
+    rows = [r[0] for r in cursor.fetchall() if r[0]]
+    conn.close()
+    if len(rows) < BASELINE_MIN_SAMPLES:
+        return None
+    return sum(rows) / len(rows)
+
+
 def get_symbol_history(inst_id: str, limit: int = 10):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT timestamp, last_price, change_24h_pct, turnover_24h, power_score,
-               freshness_ratio, final_score, oi_change_pct, cvd_buy_ratio, yorum
+               freshness_ratio, final_score, oi_change_pct, cvd_buy_ratio, yorum,
+               volume_ratio
         FROM hype_observations
         WHERE inst_id = ?
         ORDER BY timestamp DESC
@@ -693,13 +746,23 @@ def run_scanner():
             if turnover_24h < MIN_TURNOVER_24H:
                 continue
 
-            power_score = abs(change_24h_pct) * math.log10(turnover_24h)
+            # --- YENI FORMUL: hacim orani (kendi gecmisine gore) ana belirleyici ---
+            avg_turnover = get_average_turnover(inst_id)
+            if avg_turnover is not None and avg_turnover > 0:
+                volume_ratio = turnover_24h / avg_turnover
+                power_score = volume_ratio * (1 + abs(change_24h_pct) / 100.0)
+            else:
+                # Yeterli gecmis yok -- guvenilir bir oran hesaplanamaz.
+                # Bu coin icin ALARM VERILMEZ, ama gozlem yine de kaydedilir
+                # (gelecekteki taramalar icin baseline birikmeye devam etsin diye).
+                volume_ratio = None
+                power_score = None
 
             freshness_ratio = 1.0
-            if power_score > 30.0:
+            if power_score is not None and power_score > FRESHNESS_CHECK_VOLUME_RATIO:
                 freshness_ratio = calculate_freshness_ratio(inst_id)
 
-            final_score = power_score * freshness_ratio
+            final_score = power_score * freshness_ratio if power_score is not None else None
 
             current_oi = oi_map.get(inst_id)
             oi_change_pct = None
@@ -727,12 +790,14 @@ def run_scanner():
                 "cvd_buy_ratio": None,
                 "position_in_range": position_in_range,
                 "yorum": None,
+                "volume_ratio": volume_ratio,
             }
 
             all_results.append(obs_data)
 
             should_notify = (
-                final_score >= ALERT_POWER_SCORE_THRESHOLD
+                final_score is not None
+                and final_score >= ALERT_POWER_SCORE_THRESHOLD
                 and not is_recently_notified(inst_id)
             )
 
@@ -752,6 +817,7 @@ def run_scanner():
                     "change": change_24h_pct,
                     "turnover": turnover_24h,
                     "score": final_score,
+                    "volume_ratio": volume_ratio,
                     "freshness": freshness_ratio,
                     "oi_change_pct": oi_change_pct,
                     "cvd_ratio": cvd_ratio,
@@ -771,7 +837,8 @@ def run_scanner():
             msg += f"• Fiyat: `{a['price']}`\n"
             msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
             msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-            msg += f"• Hacim İvmesi: `{a['freshness']:.2f}x`\n"
+            msg += f"• Hacim Orani (normale gore): `{a['volume_ratio']:.2f}x`\n"
+            msg += f"• Hacim İvmesi (kisa vade): `{a['freshness']:.2f}x`\n"
             if a["oi_change_pct"] is not None:
                 msg += f"• OI Değişimi (24s): `%{a['oi_change_pct']:.1f}`\n"
             if a["cvd_ratio"] is not None:
@@ -781,14 +848,20 @@ def run_scanner():
 
         send_telegram_alert(msg)
 
-    top_candidates = sorted(all_results, key=lambda x: x["final_score"], reverse=True)[:5]
+    # None olan final_score'lari (yeterli gecmisi olmayan coinler) siralamada
+    # en sona at, hata vermesinler.
+    top_candidates = sorted(
+        all_results, key=lambda x: x["final_score"] if x["final_score"] is not None else -1, reverse=True
+    )[:5]
     if top_candidates:
         logging.info("📊 Şu Anki En Yüksek Skorlu 5 Coin:")
         for c in top_candidates:
             oi_str = f"{c['oi_change_pct']:.1f}%" if c.get("oi_change_pct") is not None else "n/a"
+            score_str = f"{c['final_score']:.2f}" if c["final_score"] is not None else "n/a (yeterli gecmis yok)"
+            vr_str = f"{c['volume_ratio']:.2f}x" if c.get("volume_ratio") is not None else "n/a"
             logging.info(
                 f"   -> {c['inst_id']:<18} | Değişim: %{c['change_24h_pct']:<6.2f} | "
-                f"İvme: {c['freshness_ratio']:<4.2f}x | OI: {oi_str:<8} | Skor: {c['final_score']:.1f}"
+                f"Hacim Orani: {vr_str:<8} | OI: {oi_str:<8} | Skor: {score_str}"
             )
 
     logging.info("✅ Tarama tamamlandı.")
@@ -823,10 +896,12 @@ if __name__ == "__main__":
         print(f"\n📊 {args.gecmis} - Son Geçmiş Kayıtları:")
         print("-" * 100)
         for r in rows:
-            ts, price, chg, turnover, power, fresh, final, oi_chg, cvd, yorum = r
+            ts, price, chg, turnover, power, fresh, final, oi_chg, cvd, yorum, vol_ratio = r
             oi_str = f"%{oi_chg:.1f}" if oi_chg is not None else "n/a"
             cvd_str = f"%{cvd*100:.0f}" if cvd is not None else "n/a"
-            print(f"{ts[:19]} | Fiyat:{price:<10.4f} | 24s%:{chg:<7.2f} | Skor:{final:<8.1f} "
+            final_str = f"{final:.2f}" if final is not None else "n/a"
+            vol_str = f"{vol_ratio:.2f}x" if vol_ratio is not None else "n/a"
+            print(f"{ts[:19]} | Fiyat:{price:<10.4f} | 24s%:{chg:<7.2f} | Hacim Orani:{vol_str:<8} | Skor:{final_str:<8} "
                   f"| OI:{oi_str:<7} | CVD:{cvd_str:<6}")
             if yorum:
                 print(f"    Not: {yorum}")
