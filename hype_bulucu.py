@@ -276,6 +276,115 @@ def analiz_page():
     return ANALIZ_SAYFA_TEMPLATE.format(symbol_value=symbol, results=results_html)
 
 
+# ---------------------------------------------------------------------------
+# BASELINE DOLDURMA (7 saatlik bekleme yerine GERCEK gecmis veriyle hizli baslangic)
+# ---------------------------------------------------------------------------
+# Bu bolum de ana tarama motoruna (run_scanner) DOKUNMAZ -- sadece ayni
+# veritabanina, Bybit'in GERCEK 14 gunluk hacim gecmisine dayanarak baseline
+# kayitlari ekler. Boylece get_average_turnover() ilk taramadan itibaren
+# gecerli bir baseline bulabilir, 7 saat beklemeye gerek kalmaz.
+
+_seed_status = {"running": False, "done": 0, "total": 0, "started_at": None, "finished_at": None}
+
+
+def _run_baseline_seeding():
+    global _seed_status
+    _seed_status["running"] = True
+    _seed_status["done"] = 0
+    _seed_status["started_at"] = datetime.now(timezone.utc).isoformat()
+    logging.info("[Seed] Gercek gecmis veriyle baseline doldurma basladi...")
+
+    tickers = get_bybit_tickers()
+    symbols = [t["symbol"] for t in tickers if t.get("symbol", "").endswith("USDT")]
+    _seed_status["total"] = len(symbols)
+
+    conn = sqlite3.connect(DB_PATH)
+    now = datetime.now(timezone.utc)
+    ok_count = 0
+
+    for symbol in symbols:
+        try:
+            url = f"{BYBIT_BASE_URL}/v5/market/kline"
+            r = requests.get(
+                url, params={"category": "linear", "symbol": symbol, "interval": "D", "limit": 14},
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("retCode") != 0:
+                continue
+            klines = data.get("result", {}).get("list", [])
+            if len(klines) < 5:
+                continue
+
+            # Bybit kline formati: [start, open, high, low, close, volume, turnover]
+            turnovers = [float(k[6]) for k in klines if float(k[6]) > 0]
+            if len(turnovers) < 5:
+                continue
+            avg_turnover = sum(turnovers) / len(turnovers)
+
+            # BASELINE_MIN_SAMPLES + pay kadar kayit ekle, hepsi
+            # BASELINE_EXCLUDE_RECENT_HOURS'un OTESINE (yani 'gecerli baseline'
+            # sayilacak bolgeye) yayilmis zaman damgalariyla.
+            n_rows = BASELINE_MIN_SAMPLES + 10
+            for i in range(n_rows):
+                ts = (
+                    now - timedelta(hours=BASELINE_EXCLUDE_RECENT_HOURS + 0.25)
+                    - timedelta(minutes=i * 15)
+                ).isoformat()
+                conn.execute(
+                    """INSERT INTO hype_observations
+                       (timestamp, inst_id, last_price, change_24h_pct, turnover_24h,
+                        power_score, freshness_ratio, final_score, notified)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (ts, symbol, 0, 0, avg_turnover, None, 1.0, None, 0),
+                )
+            conn.commit()
+            ok_count += 1
+        except Exception as e:
+            logging.error(f"[Seed] {symbol} hata: {e}")
+
+        _seed_status["done"] += 1
+        time.sleep(0.1)  # Bybit rate-limit'ine karsi kibar davran
+
+    conn.close()
+    _seed_status["running"] = False
+    _seed_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+    logging.info(f"[Seed] Tamamlandi. {ok_count}/{len(symbols)} sembol icin baseline dolduruldu.")
+
+
+@app.route("/seed_baseline")
+def seed_baseline_route():
+    """
+    Telefondan/tarayicidan bir kez ziyaret edilir:
+    https://senin-adresin.onrender.com/seed_baseline?key=GIZLI_ANAHTARIN
+    Arka planda calisir (birkac dakika surer), sayfa hemen doner.
+    Ilerlemeyi /seed_status adresinden takip edebilirsin.
+    """
+    key = request.args.get("key", "")
+    if key != SEED_SECRET_KEY:
+        return "Yetkisiz -- dogru 'key' parametresini gir.", 403
+
+    if _seed_status["running"]:
+        return "Zaten calisiyor. Ilerlemeyi /seed_status adresinden takip et.", 200
+
+    thread = threading.Thread(target=_run_baseline_seeding, daemon=True)
+    thread.start()
+    return (
+        "Baseline doldurma islemi arka planda BASLADI (birkac dakika surebilir). "
+        "Ilerlemeyi /seed_status adresinden takip edebilirsin.",
+        200,
+    )
+
+
+@app.route("/seed_status")
+def seed_status_route():
+    s = _seed_status
+    if s["started_at"] is None:
+        return "Henuz hic calistirilmadi."
+    durum = "CALISIYOR" if s["running"] else "TAMAMLANDI"
+    return f"Durum: {durum} | Ilerleme: {s['done']}/{s['total']} | Baslangic: {s['started_at']} | Bitis: {s['finished_at']}"
+
+
 def run_flask():
     """Render'ın atadığı PORT üzerinden Flask sunucusunu başlatır."""
     port = int(os.environ.get("PORT", 10000))
@@ -290,6 +399,12 @@ DB_PATH = "hype_history.db"
 # Bybit'in resmi alternatif alan adi -- Render'dan test edilip sorunsuz
 # calistigi kanitlandi (bkz. daha onceki deploy loglari).
 BYBIT_BASE_URL = "https://api.bytick.com"
+
+# /seed_baseline adresini yetkisiz kullanimdan korumak icin basit bir anahtar.
+# Render'da Environment Variable olarak SEED_SECRET_KEY tanimlayip kendi
+# gizli degerini belirlemen onerilir -- tanimlamazsan varsayilan kullanilir
+# (herkese acik URL oldugu icin bunu degistirmen guvenlik acisindan iyi olur).
+SEED_SECRET_KEY = os.environ.get("SEED_SECRET_KEY", "degistir-bu-anahtari")
 
 SCAN_INTERVAL_SECONDS = 900
 
