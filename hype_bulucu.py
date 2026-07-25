@@ -114,7 +114,7 @@ def fetch_daily_klines(symbol: str, limit: int = 250):
     Bybit'ten gunluk mum verisi ceker, KRONOLOJIK (en eski once) sirada
     dondurur -- Bybit API'si aksi yonde (en yeni once) verdigi icin ters
     ceviriyoruz.
-    Donus: (closes, highs, lows) listeleri, hepsi ayni sirada.
+    Donus: (closes, highs, lows, turnovers) listeleri, hepsi ayni sirada.
     """
     url = f"{BYBIT_BASE_URL}/v5/market/kline"
     r = requests.get(
@@ -131,16 +131,122 @@ def fetch_daily_klines(symbol: str, limit: int = 250):
     closes = [float(c[4]) for c in raw]
     highs = [float(c[2]) for c in raw]
     lows = [float(c[3]) for c in raw]
-    return closes, highs, lows
+    turnovers = [float(c[6]) for c in raw]
+    return closes, highs, lows, turnovers
+
+
+def get_funding_rate(symbol: str):
+    """
+    Bybit'in ticker cevabinda ZATEN gelen funding rate degerini ceker
+    (ekstra endpoint gerekmiyor). Asiri pozitif/negatif funding rate,
+    piyasanin cok agresif long/short'a yuklendigini gosterir -- genelde
+    siddetli tersine donuslerden once gorulur.
+    """
+    url = f"{BYBIT_BASE_URL}/v5/market/tickers"
+    r = requests.get(url, params={"category": "linear", "symbol": symbol}, timeout=10)
+    data = r.json()
+    if data.get("retCode") != 0:
+        return None
+    lst = data.get("result", {}).get("list", [])
+    if not lst:
+        return None
+    try:
+        return float(lst[0].get("fundingRate"))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_long_short_ratio(symbol: str):
+    """
+    Bybit kullanicilarinin gercek long/short pozisyon oranini ceker.
+    Donus: {'buy_ratio': 0.0-1.0, 'sell_ratio': 0.0-1.0} ya da None.
+    """
+    url = f"{BYBIT_BASE_URL}/v5/market/account-ratio"
+    r = requests.get(
+        url, params={"category": "linear", "symbol": symbol, "period": "1h", "limit": 1},
+        timeout=10,
+    )
+    data = r.json()
+    if data.get("retCode") != 0:
+        return None
+    lst = data.get("result", {}).get("list", [])
+    if not lst:
+        return None
+    try:
+        return {"buy_ratio": float(lst[0]["buyRatio"]), "sell_ratio": float(lst[0]["sellRatio"])}
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def compute_volume_comparison(turnovers):
+    """
+    Gunluk mum verisindeki ciro listesinden, SON GUNU disleyerek (kendi
+    baseline'ini kirletmesin diye) gecmis ortalamayi hesaplar, son gunun
+    cirosunu bu ortalamayla kiyaslar.
+    Donus: {'today': X, 'avg_before': Y, 'ratio': Z} ya da None.
+    """
+    if len(turnovers) < 6:
+        return None
+    today = turnovers[-1]
+    history = turnovers[:-1]
+    avg_before = sum(history) / len(history)
+    if avg_before <= 0:
+        return None
+    return {"today": today, "avg_before": avg_before, "ratio": today / avg_before}
+
+
+def get_coingecko_market_data(symbol: str):
+    """
+    Bybit sembolunden (orn 'BTCUSDT') taban varlik ismini cikarip (BTC),
+    CoinGecko'da arayip market cap / dolasimdaki arz bilgisini ceker.
+    DIKKAT: sembol eslestirmesi bazi kucuk/yeni coinler icin basarisiz
+    olabilir -- bu durumda None doner, hata firlatmaz (sayfa cokmez).
+    """
+    base = symbol.replace("USDT", "").strip()
+    if not base:
+        return None
+    try:
+        search_url = "https://api.coingecko.com/api/v3/search"
+        r = requests.get(search_url, params={"query": base}, timeout=8)
+        data = r.json()
+        coins = data.get("coins", [])
+        # Sembolu TAM eslesen ilk sonucu tercih et (en alakali coin genelde
+        # arama sonuclarinin basinda gelir, CoinGecko piyasa degerine gore siraliyor)
+        exact_matches = [c for c in coins if c.get("symbol", "").upper() == base.upper()]
+        candidate = exact_matches[0] if exact_matches else (coins[0] if coins else None)
+        if not candidate:
+            return None
+        coin_id = candidate.get("id")
+        if not coin_id:
+            return None
+
+        detail_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+        r2 = requests.get(
+            detail_url,
+            params={"localization": "false", "tickers": "false", "market_data": "true",
+                    "community_data": "false", "developer_data": "false"},
+            timeout=8,
+        )
+        detail = r2.json()
+        market_data = detail.get("market_data", {})
+        market_cap = market_data.get("market_cap", {}).get("usd")
+        circulating = market_data.get("circulating_supply")
+        rank = detail.get("market_cap_rank")
+        if market_cap is None:
+            return None
+        return {"market_cap": market_cap, "circulating_supply": circulating, "rank": rank, "coingecko_id": coin_id}
+    except Exception:
+        return None
 
 
 def generate_technical_summary(symbol: str):
     """
-    Bir coin icin RSI/MA/MACD/ATR/destek-direnc hesaplayip okunabilir bir
-    Turkce ozet uretir. Bu bir tahmin/tavsiye/TP hedefi DEGILDIR -- sadece
-    mevcut teknik durumun okunabilir bir ozetidir, karar tamamen kullanicinin.
+    Bir coin icin RSI/MA/MACD/ATR/destek-direnc + CVD/hacim/funding/long-short/
+    market cap hesaplayip okunabilir bir Turkce ozet uretir. Bu bir
+    tahmin/tavsiye/TP hedefi DEGILDIR -- sadece mevcut teknik durumun
+    okunabilir bir ozetidir, karar tamamen kullanicinin.
     """
-    closes, highs, lows = fetch_daily_klines(symbol)
+    closes, highs, lows, turnovers = fetch_daily_klines(symbol)
     last_price = closes[-1]
 
     rsi = calculate_rsi(closes)
@@ -150,10 +256,29 @@ def generate_technical_summary(symbol: str):
     macd = calculate_macd(closes)
     atr = calculate_atr(highs, lows, closes)
     levels = find_support_resistance(highs, lows, lookback=30)
+    volume_cmp = compute_volume_comparison(turnovers)
+
+    # Bu veri kaynaklari basarisiz olsa bile (agsal hata, sembol eslesmedi vb.)
+    # sayfa COKMEMELI -- her biri kendi try/except'i ile korunuyor.
+    try:
+        cvd_ratio = get_cvd_buy_ratio(symbol)
+    except Exception:
+        cvd_ratio = None
+    try:
+        funding_rate = get_funding_rate(symbol)
+    except Exception:
+        funding_rate = None
+    try:
+        long_short = get_long_short_ratio(symbol)
+    except Exception:
+        long_short = None
+    try:
+        market_data = get_coingecko_market_data(symbol)
+    except Exception:
+        market_data = None
 
     notlar = []
 
-    # RSI yorumu
     if rsi is not None:
         if rsi >= 70:
             notlar.append(f"RSI {rsi:.0f} -- aşırı alım bölgesinde, kısa vadeli geri çekilme riski artmış olabilir.")
@@ -162,7 +287,6 @@ def generate_technical_summary(symbol: str):
         else:
             notlar.append(f"RSI {rsi:.0f} -- nötr bölgede, belirgin bir aşırılık yok.")
 
-    # MA (trend) yorumu
     if ma20 and ma50 and ma200:
         if last_price > ma20 > ma50 > ma200:
             notlar.append("Fiyat MA20/MA50/MA200'ün üzerinde ve sıralama yükseliş trendine işaret ediyor (güçlü trend).")
@@ -173,7 +297,6 @@ def generate_technical_summary(symbol: str):
         else:
             notlar.append("Fiyat uzun vadeli ortalamanın (MA200) altında, genel görünüm zayıf.")
 
-    # MACD yorumu
     if macd:
         if macd["histogram"] > 0 and macd["prev_histogram"] <= 0:
             notlar.append("MACD az önce pozitif kesişim yaptı -- yükseliş momentumu yeni başlıyor olabilir.")
@@ -184,7 +307,6 @@ def generate_technical_summary(symbol: str):
         else:
             notlar.append("MACD negatif -- düşüş momentumu devam ediyor.")
 
-    # Destek/Direnç + ATR (volatilite bandı)
     if levels:
         dist_to_resistance = (levels["resistance"] - last_price) / last_price * 100
         dist_to_support = (last_price - levels["support"]) / last_price * 100
@@ -196,6 +318,39 @@ def generate_technical_summary(symbol: str):
         atr_pct = atr / last_price * 100
         notlar.append(f"Ortalama günlük volatilite (ATR): ~%{atr_pct:.1f} -- bu, günlük 'normal' dalgalanma büyüklüğü.")
 
+    if volume_cmp:
+        notlar.append(
+            f"Bugünkü ciro, önceki günlerin ortalamasının {volume_cmp['ratio']:.2f} katı "
+            f"({'artış' if volume_cmp['ratio'] >= 1 else 'azalış'})."
+        )
+
+    if cvd_ratio is not None:
+        if cvd_ratio >= 0.60:
+            notlar.append(f"CVD: son işlemlerin %{cvd_ratio*100:.0f}'i alış -- alıcı baskısı güçlü.")
+        elif cvd_ratio <= 0.45:
+            notlar.append(f"CVD: son işlemlerin sadece %{cvd_ratio*100:.0f}'i alış -- satıcı baskısı ağır basıyor.")
+        else:
+            notlar.append(f"CVD: alış oranı %{cvd_ratio*100:.0f} -- dengeli, belirgin bir baskı yok.")
+
+    if funding_rate is not None:
+        funding_pct = funding_rate * 100
+        if funding_pct >= 0.05:
+            notlar.append(f"Funding rate %{funding_pct:.3f} -- long tarafı belirgin şekilde kalabalık, ani bir long tasfiyesi riski artmış olabilir.")
+        elif funding_pct <= -0.05:
+            notlar.append(f"Funding rate %{funding_pct:.3f} -- short tarafı belirgin şekilde kalabalık, ani bir short squeeze riski artmış olabilir.")
+        else:
+            notlar.append(f"Funding rate %{funding_pct:.3f} -- nötr, aşırı bir pozisyon yığılması yok.")
+
+    if long_short is not None:
+        notlar.append(
+            f"Kullanıcı Long/Short oranı: %{long_short['buy_ratio']*100:.0f} long / "
+            f"%{long_short['sell_ratio']*100:.0f} short."
+        )
+
+    if market_data is not None:
+        rank_str = f" (piyasa değeri sıralaması: #{market_data['rank']})" if market_data.get("rank") else ""
+        notlar.append(f"Market cap: ~${market_data['market_cap']:,.0f}{rank_str}.")
+
     return {
         "symbol": symbol,
         "last_price": last_price,
@@ -206,6 +361,11 @@ def generate_technical_summary(symbol: str):
         "macd": macd,
         "atr": atr,
         "levels": levels,
+        "volume_cmp": volume_cmp,
+        "cvd_ratio": cvd_ratio,
+        "funding_rate": funding_rate,
+        "long_short": long_short,
+        "market_data": market_data,
         "notlar": notlar,
     }
 
@@ -257,6 +417,28 @@ def analiz_page():
         try:
             r = generate_technical_summary(symbol)
             notlar_html = "".join(f'<div class="not-item">• {n}</div>' for n in r["notlar"])
+
+            cvd_row = ""
+            if r.get("cvd_ratio") is not None:
+                cvd_row = f'<div class="row"><span class="label">CVD (Alis Orani)</span><span>%{r["cvd_ratio"]*100:.0f}</span></div>'
+
+            funding_row = ""
+            if r.get("funding_rate") is not None:
+                funding_row = f'<div class="row"><span class="label">Funding Rate</span><span>%{r["funding_rate"]*100:.3f}</span></div>'
+
+            ls_row = ""
+            if r.get("long_short") is not None:
+                ls = r["long_short"]
+                ls_row = f'<div class="row"><span class="label">Long/Short</span><span>%{ls["buy_ratio"]*100:.0f} / %{ls["sell_ratio"]*100:.0f}</span></div>'
+
+            vol_row = ""
+            if r.get("volume_cmp") is not None:
+                vol_row = f'<div class="row"><span class="label">Hacim Orani (bugun/ortalama)</span><span>{r["volume_cmp"]["ratio"]:.2f}x</span></div>'
+
+            mcap_row = ""
+            if r.get("market_data") is not None:
+                mcap_row = f'<div class="row"><span class="label">Market Cap</span><span>${r["market_data"]["market_cap"]:,.0f}</span></div>'
+
             results_html = f"""
             <div class="card">
               <div class="row"><span class="label">Sembol</span><span>{r['symbol']}</span></div>
@@ -264,6 +446,11 @@ def analiz_page():
               <div class="row"><span class="label">RSI (14)</span><span>{r['rsi']:.1f}</span></div>
               <div class="row"><span class="label">MA20 / MA50 / MA200</span><span>{r['ma20']:.6g} / {r['ma50']:.6g} / {r['ma200']:.6g}</span></div>
               <div class="row"><span class="label">MACD Histogram</span><span>{r['macd']['histogram']:.6g}</span></div>
+              {vol_row}
+              {cvd_row}
+              {funding_row}
+              {ls_row}
+              {mcap_row}
             </div>
             <div class="card">
               <b>Teknik Ozet:</b>
