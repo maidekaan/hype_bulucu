@@ -938,6 +938,144 @@ def get_all_open_interest(tickers):
     return result
 
 
+def fetch_recent_klines_short(inst_id: str, interval: str = "15", limit: int = 30):
+    """
+    Bybit'ten KISA VADELI (varsayilan 15 dakikalik) mum verisi ceker,
+    KRONOLOJIK (en eski once) sirada dondurur.
+    Bu, "hareket ne zaman basladi, hala hizlaniyor mu" sorusuna cevap
+    vermek icin kullanilir -- gunluk mumlardan cok daha hassas bir
+    zaman cozunurlugu saglar (30 mum x 15dk = ~7.5 saatlik pencere).
+
+    Kendi veritabanimiza IHTIYAC DUYMAZ -- Bybit'in kendi gecmis
+    mumlarindan anlik olarak cekilir, bu yuzden yeni deploy sonrasi
+    bekleme suresi gerektirmez.
+
+    Donus: (closes, turnovers) listeleri, kronolojik sirada. Basarisiz
+    olursa (None, None) doner -- cagiran kod bunu kontrol etmeli.
+    """
+    try:
+        url = f"{BYBIT_BASE_URL}/v5/market/kline"
+        r = requests.get(
+            url, params={"category": "linear", "symbol": inst_id, "interval": interval, "limit": limit},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None, None
+        raw = data.get("result", {}).get("list", [])
+        if len(raw) < 5:
+            return None, None
+        raw = list(reversed(raw))  # kronolojik siraya cevir
+        closes = [float(c[4]) for c in raw]
+        turnovers = [float(c[6]) for c in raw]
+        return closes, turnovers
+    except Exception as e:
+        logging.error(f"{inst_id} kisa vadeli mum verisi hatasi: {e}")
+        return None, None
+
+
+def find_breakout_start_minutes_ago(turnovers, bar_minutes: int = 15, volume_multiplier: float = 2.5, baseline_bars: int = 8):
+    """
+    Kisa vadeli ciro listesinde, hangi bardan itibaren hacmin, pencerenin
+    EN ESKI 'baseline_bars' barinin ortalamasini 'volume_multiplier' katini
+    surekli astigini bulur. Bu, "hareket kac dakikadir suruyor" sorusuna
+    cevap verir.
+
+    ONEMLI: Baseline, TUM pencerenin ortalamasi DEGIL, sadece pencerenin
+    EN BASINDAKI birkaç bar -- eger patlama pencerenin yarisindan fazlasini
+    kapliyorsa, tum pencere ortalamasi kendi kendini kirletir (patlamanin
+    kendisi 'normal' sanilir). Bu yuzden sadece en eski (muhtemelen
+    patlama-oncesi) barlari referans aliyoruz.
+
+    turnovers: KRONOLOJIK sirada (en eski once) ciro listesi.
+    Donus: dakika cinsinden sure (int) ya da tespit edilemezse None.
+    """
+    if len(turnovers) < baseline_bars + 3:
+        return None
+    baseline_segment = turnovers[:baseline_bars]
+    baseline_avg = sum(baseline_segment) / len(baseline_segment)
+    if baseline_avg <= 0:
+        return None
+    threshold = baseline_avg * volume_multiplier
+
+    start_idx = None
+    for i in range(baseline_bars, len(turnovers)):
+        if turnovers[i] >= threshold:
+            start_idx = i
+            break
+    if start_idx is None:
+        return None
+
+    bars_since_start = len(turnovers) - 1 - start_idx
+    return bars_since_start * bar_minutes
+
+
+def classify_freshness(inst_id: str):
+    """
+    Kisa vadeli (15 dakikalik) veriye bakarak bu hareketin TAZE mi yoksa
+    zaten UZAMIS mi oldugunu belirler. Bu, "coin sinyale geldiginde zaten
+    %25 yukselmis, ama bu YENI mi baslamis yoksa saatlerdir mi suruyor"
+    sorusuna canli olarak cevap verir.
+
+    Bu fonksiyon SADECE alarm gonderilecek adaylar icin cagrilir (tum
+    piyasa icin degil) -- gereksiz API yukunu onlemek adina.
+
+    Donus: {'label': 'TAZE'/'UZAMIS'/'BELIRSIZ', 'short_rsi': float/None,
+            'breakout_age_minutes': int/None, 'aciklama': str}
+    """
+    closes, turnovers = fetch_recent_klines_short(inst_id, interval="15", limit=30)
+
+    if closes is None or len(closes) < 15:
+        return {
+            "label": "BELIRSIZ",
+            "short_rsi": None,
+            "breakout_age_minutes": None,
+            "aciklama": "Kisa vadeli veri yetersiz, taze/uzamis ayrimi yapilamadi.",
+        }
+
+    short_rsi = calculate_rsi(closes, period=14)
+    breakout_age = find_breakout_start_minutes_ago(turnovers, bar_minutes=15)
+
+    # Karar mantigi: RSI COK yuksekse VE hareket uzun suredir devam
+    # ediyorsa -> UZAMIS. RSI henuz asiri degilse VE/VEYA hareket
+    # yeni basladiysa -> TAZE. Ikisi de net degilse -> BELIRSIZ.
+    is_rsi_extreme = short_rsi is not None and short_rsi >= 75
+    is_old = breakout_age is not None and breakout_age >= 120  # 2 saatten fazla suruyorsa 'eski' say
+    is_fresh = breakout_age is not None and breakout_age <= 45  # 45 dakikadan azsa 'taze' say
+
+    if is_rsi_extreme and is_old:
+        label = "UZAMIS"
+        aciklama = (
+            f"Kisa vadeli RSI {short_rsi:.0f} (asiri alim) ve hareket ~{breakout_age} dakikadir "
+            f"suruyor -- bu, zaten uzamis bir hareket, tukenme riski yuksek olabilir."
+        )
+    elif is_fresh and not is_rsi_extreme:
+        label = "TAZE"
+        rsi_str = f"{short_rsi:.0f}" if short_rsi is not None else "n/a"
+        aciklama = (
+            f"Hareket ~{breakout_age} dakika once baslamis, kisa vadeli RSI {rsi_str} -- "
+            f"henuz erken asamada gorunuyor."
+        )
+    elif is_rsi_extreme:
+        label = "UZAMIS"
+        aciklama = f"Kisa vadeli RSI {short_rsi:.0f} (asiri alim) -- hareketin sonuna yaklasilmis olabilir."
+    elif is_fresh:
+        label = "TAZE"
+        aciklama = f"Hareket ~{breakout_age} dakika once baslamis -- henuz erken asamada."
+    else:
+        label = "BELIRSIZ"
+        rsi_str = f"{short_rsi:.0f}" if short_rsi is not None else "n/a"
+        age_str = f"~{breakout_age} dk" if breakout_age is not None else "n/a"
+        aciklama = f"Kisa vadeli RSI {rsi_str}, hareket yasi {age_str} -- net bir taze/uzamis ayrimi yok."
+
+    return {
+        "label": label,
+        "short_rsi": short_rsi,
+        "breakout_age_minutes": breakout_age,
+        "aciklama": aciklama,
+    }
+
+
 def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
     """
     Son islemlerin ne kadarinin agresif ALIS, ne kadarinin agresif SATIS
@@ -1185,6 +1323,16 @@ def run_scanner():
                     change_24h_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio
                 )
 
+                # YENI: kisa vadeli (15dk) veriyle TAZE/UZAMIS tespiti.
+                # Kendi veritabanimiza ihtiyac duymaz, Bybit'in kendi
+                # kisa vadeli mumlarindan anlik hesaplanir.
+                try:
+                    freshness_info = classify_freshness(inst_id)
+                except Exception as e:
+                    logging.error(f"{inst_id} TAZE/UZAMIS tespiti hatasi: {e}")
+                    freshness_info = {"label": "BELIRSIZ", "short_rsi": None,
+                                       "breakout_age_minutes": None, "aciklama": "Hesaplanamadi."}
+
                 # CoinGecko Trending ile capraz teyit -- bu coin hem bizim
                 # hacim taramamizda HEM CoinGecko'nun kendi arama trendinde
                 # cikiyorsa, bu guclu bir capraz dogrulamadir.
@@ -1202,6 +1350,7 @@ def run_scanner():
                     "price": last_price,
                     "change": change_24h_pct,
                     "turnover": turnover_24h,
+                    "freshness_info": freshness_info,
                     "score": final_score,
                     "volume_ratio": volume_ratio,
                     "freshness": freshness_ratio,
@@ -1220,6 +1369,19 @@ def run_scanner():
         for a in alerts_to_send:
             direction = "🟢" if a["change"] >= 0 else "🔴"
             msg += f"{direction} *{a['inst_id']}*\n"
+
+            # YENI: TAZE/UZAMIS etiketi -- en one, en dikkat cekici yere konuyor
+            fi = a.get("freshness_info", {})
+            label = fi.get("label", "BELIRSIZ")
+            if label == "TAZE":
+                msg += "🟢 *TAZE* -- erken asamada, potansiyel devam edebilir\n"
+            elif label == "UZAMIS":
+                msg += "🔴 *UZAMIS* -- zaten isinmis, tukenme riski yuksek olabilir\n"
+            else:
+                msg += "⚪ *BELIRSIZ* -- taze/uzamis ayrimi icin yeterli veri yok\n"
+            if fi.get("aciklama"):
+                msg += f"   _{fi['aciklama']}_\n"
+
             msg += f"• Fiyat: `{a['price']}`\n"
             msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
             msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
