@@ -685,6 +685,20 @@ ALERT_POWER_SCORE_THRESHOLD = 6.0
 
 ALERT_COOLDOWN_HOURS = 6.0
 
+# --- YENI: Konsolidasyon + Hacimli Kirilim Sinyali (ayri, paralel bir katman) ---
+# Mantik: 1 saatlik mumlarla son N mumu 'konsolidasyon araligi' olarak al,
+# aralik yeterince DAR mi kontrol et, sonra EN SON KAPANMIS mumun bu araligi
+# HACIMLI sekilde kapanisla kirip kirmadigina bak. 5 dakikalik mumlarla da
+# kirilimin 'sahte' (fake breakout/fitil) olmadigini teyit et.
+BREAKOUT_LOOKBACK_HOURS = 10             # kac saatlik mum konsolidasyon penceresi olarak alinir
+BREAKOUT_RANGE_MAX_PCT = 12.0             # bu yuzdenin uzerindeki genis araliklar 'konsolidasyon' sayilmaz
+BREAKOUT_VOLUME_MULTIPLIER = 2.0          # kirilim mumunun hacmi, pencere ortalamasinin bu katini gecmeli
+BREAKOUT_PREFILTER_VOLUME_RATIO = 1.5     # bu hacim oranini gecen coinler icin (ucuz, DB'den) pahali
+                                            # Bybit kontrolu (kirilim tespiti) calistirilir -- 800 coin
+                                            # icin degil, sadece zaten hafif ilgi gosterenler icin
+BREAKOUT_ALERT_COOLDOWN_HOURS = 4.0        # ayri bir cooldown -- ana hype alarmindan bagimsiz
+
+
 # --- YENI: OI / CVD / Tukenme kontrolu icin esikler ---
 OI_CHANGE_STRONG_PCT = 5.0        # bu yuzdenin uzerinde OI artisi 'guclu yeni pozisyon girisi' sayilir
 OI_CHANGE_WEAK_NEGATIVE_PCT = -3.0  # bu yuzdenin altinda OI dususu 'short squeeze' isareti sayilir
@@ -725,6 +739,20 @@ def init_db():
     """)
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_inst_time ON hype_observations (inst_id, timestamp)"
+    )
+
+    # YENI: Kirilim sinyali icin tamamen AYRI bir tablo -- mevcut
+    # hype_observations tablosuna hic dokunmuyor, sifir risk.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS breakout_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            inst_id TEXT NOT NULL,
+            direction TEXT NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_breakout_inst_time ON breakout_alerts (inst_id, timestamp)"
     )
 
     for col_def in [
@@ -1076,6 +1104,163 @@ def classify_freshness(inst_id: str):
     }
 
 
+def fetch_klines_generic(symbol: str, interval: str, limit: int):
+    """
+    Bybit'ten herhangi bir zaman dilimi icin mum verisi ceker, KRONOLOJIK
+    (en eski once) sirada dondurur. Genel amacli yardimci fonksiyon --
+    kirilim tespiti icin 1 saatlik ve 5 dakikalik mumlarda kullanilir.
+    Donus: [{'open','high','low','close','turnover'}, ...] ya da basarisiz
+    olursa None.
+    """
+    try:
+        url = f"{BYBIT_BASE_URL}/v5/market/kline"
+        r = requests.get(
+            url, params={"category": "linear", "symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("retCode") != 0:
+            return None
+        raw = data.get("result", {}).get("list", [])
+        if len(raw) < 3:
+            return None
+        raw = list(reversed(raw))
+        bars = [
+            {"open": float(c[1]), "high": float(c[2]), "low": float(c[3]),
+             "close": float(c[4]), "turnover": float(c[6])}
+            for c in raw
+        ]
+        return bars
+    except Exception as e:
+        logging.error(f"{symbol} genel mum verisi hatasi ({interval}): {e}")
+        return None
+
+
+def detect_range_breakout(symbol: str):
+    """
+    Konsolidasyon + hacimli kapanis kirilimi tespit eder (kullanicinin
+    ZIL/USDT grafik ornegindeki paterne dayanir).
+
+    1) Son BREAKOUT_LOOKBACK_HOURS saatlik mumu (kirilim mumu HARIC)
+       'konsolidasyon penceresi' olarak alir.
+    2) Bu pencerenin yeterince DAR oldugunu dogrular (cok genisse
+       zaten konsolidasyon degildir, kirilim anlamsizdir).
+    3) EN SON KAPANMIS mumun bu araligi HACIMLI sekilde kapanisla kirip
+       kirmadigina bakar.
+
+    Donus: {'direction':'UP'/'DOWN', 'breakout_close':.., 'range_high':..,
+            'range_low':.., 'volume_ratio':..} ya da None (kirilim yok).
+    """
+    bars = fetch_klines_generic(symbol, interval="60", limit=BREAKOUT_LOOKBACK_HOURS + 2)
+    if bars is None or len(bars) < BREAKOUT_LOOKBACK_HOURS + 1:
+        return None
+
+    breakout_bar = bars[-1]  # Bybit sadece KAPANMIS mumlari dondurur
+    range_bars = bars[-(BREAKOUT_LOOKBACK_HOURS + 1):-1]  # kirilim mumu HARIC onceki N mum
+
+    range_high = max(b["high"] for b in range_bars)
+    range_low = min(b["low"] for b in range_bars)
+    if range_low <= 0:
+        return None
+
+    range_width_pct = (range_high - range_low) / range_low * 100.0
+    if range_width_pct > BREAKOUT_RANGE_MAX_PCT:
+        return None  # cok genis, konsolidasyon sayilmaz
+
+    range_avg_turnover = sum(b["turnover"] for b in range_bars) / len(range_bars)
+    if range_avg_turnover <= 0:
+        return None
+    volume_ratio = breakout_bar["turnover"] / range_avg_turnover
+
+    direction = None
+    if breakout_bar["close"] > range_high and volume_ratio >= BREAKOUT_VOLUME_MULTIPLIER:
+        direction = "UP"
+    elif breakout_bar["close"] < range_low and volume_ratio >= BREAKOUT_VOLUME_MULTIPLIER:
+        direction = "DOWN"
+
+    if direction is None:
+        return None
+
+    return {
+        "direction": direction,
+        "breakout_close": breakout_bar["close"],
+        "range_high": range_high,
+        "range_low": range_low,
+        "volume_ratio": volume_ratio,
+    }
+
+
+def confirm_breakout_hold(symbol: str, direction: str, breakout_level: float):
+    """
+    Kirilimdan sonra fiyatin seviyeyi koruyup korumadigini 5 dakikalik
+    mumlarla kontrol eder -- 'sahte kirilim' (fake breakout/fitil) filtresi.
+    Kucuk bir tolerans (%0.5) payi birakilir, gurultuye karsi.
+
+    Donus: True (teyit edildi, seviye korunuyor) / False (geri donmus,
+    sahte olabilir) / None (yeterli veri yok).
+    """
+    bars = fetch_klines_generic(symbol, interval="5", limit=6)
+    if bars is None or len(bars) < 3:
+        return None
+    recent_closes = [b["close"] for b in bars[-3:]]
+    if direction == "UP":
+        return all(c >= breakout_level * 0.995 for c in recent_closes)
+    else:
+        return all(c <= breakout_level * 1.005 for c in recent_closes)
+
+
+def is_recently_notified_breakout(inst_id: str) -> bool:
+    """Kirilim sinyali icin AYRI bir cooldown -- ana hype alarmindan bagimsiz."""
+    conn = sqlite3.connect(DB_PATH)
+    cutoff_time = (
+        datetime.now(timezone.utc) - timedelta(hours=BREAKOUT_ALERT_COOLDOWN_HOURS)
+    ).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM breakout_alerts WHERE inst_id = ? AND timestamp >= ?",
+        (inst_id, cutoff_time),
+    ).fetchone()
+    conn.close()
+    return row[0] > 0
+
+
+def record_breakout_alert(inst_id: str, direction: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO breakout_alerts (timestamp, inst_id, direction) VALUES (?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), inst_id, direction),
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_breakout_alert(inst_id: str, breakout_info: dict, hold_confirmed):
+    """Kirilim sinyalini AYRI bir Telegram mesaji olarak gonderir."""
+    direction = breakout_info["direction"]
+    emoji = "📈" if direction == "UP" else "📉"
+    yon_text = "YUKARI KIRILIM" if direction == "UP" else "ASAGI KIRILIM (SHORT)"
+
+    hold_text = ""
+    if hold_confirmed is True:
+        hold_text = "✅ 5dk teyit: seviye korunuyor (sahte kirilim degil gibi gorunuyor)"
+    elif hold_confirmed is False:
+        hold_text = "⚠️ 5dk teyit: fiyat geri donmus olabilir -- dikkatli ol, sahte kirilim (fake breakout) riski var"
+    else:
+        hold_text = "ℹ️ 5dk teyit verisi yetersiz"
+
+    msg = (
+        f"{emoji} *{yon_text}* -- {inst_id}\n\n"
+        f"Konsolidasyon araligi: {breakout_info['range_low']:.6g} - {breakout_info['range_high']:.6g}\n"
+        f"Kirilim kapanisi: {breakout_info['breakout_close']:.6g}\n"
+        f"Kirilim hacmi: pencere ortalamasinin {breakout_info['volume_ratio']:.1f} kati\n"
+        f"{hold_text}\n\n"
+        f"_Bu ayri bir tespit turudur -- ana hacim/skor sistemi ile bagimsiz calisir. "
+        f"Yatirim tavsiyesi degildir._"
+    )
+    send_telegram_alert(msg)
+    record_breakout_alert(inst_id, direction)
+    logging.info(f"[Kirilim] {inst_id} icin {direction} kirilim sinyali gonderildi.")
+
+
 def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
     """
     Son islemlerin ne kadarinin agresif ALIS, ne kadarinin agresif SATIS
@@ -1308,6 +1493,25 @@ def run_scanner():
             }
 
             all_results.append(obs_data)
+
+            # --- YENI: Kirilim sinyali (ana hype sistemine PARALEL, bagimsiz) ---
+            # Sadece hafif bir on-filtreyi (ucuz, kendi DB'mizden) gecen coinler
+            # icin pahali Bybit kontrolu (kirilim tespiti) calistiriyoruz --
+            # 750+ coin icin degil, sadece zaten bir miktar ilgi gorenler icin.
+            try:
+                if (
+                    volume_ratio is not None
+                    and volume_ratio >= BREAKOUT_PREFILTER_VOLUME_RATIO
+                    and not is_recently_notified_breakout(inst_id)
+                ):
+                    breakout_info = detect_range_breakout(inst_id)
+                    if breakout_info is not None:
+                        hold_confirmed = confirm_breakout_hold(
+                            inst_id, breakout_info["direction"], breakout_info["breakout_close"]
+                        )
+                        send_breakout_alert(inst_id, breakout_info, hold_confirmed)
+            except Exception as e:
+                logging.error(f"{inst_id} kirilim tespiti hatasi: {e}")
 
             should_notify = (
                 final_score is not None
