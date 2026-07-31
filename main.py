@@ -1092,17 +1092,23 @@ def classify_freshness(inst_id: str):
     short_rsi = calculate_rsi(closes, period=14)
     breakout_age = find_breakout_start_minutes_ago(turnovers, bar_minutes=15)
 
-    # Karar mantigi: RSI COK yuksekse VE hareket uzun suredir devam
-    # ediyorsa -> UZAMIS. RSI henuz asiri degilse VE/VEYA hareket
-    # yeni basladiysa -> TAZE. Ikisi de net degilse -> BELIRSIZ.
-    is_rsi_extreme = short_rsi is not None and short_rsi >= 75
+    # Karar mantigi: RSI COK yuksek (asiri alim) YA DA COK dusuk (asiri
+    # satim) VE hareket uzun suredir devam ediyorsa -> UZAMIS. Bu, hem
+    # yukselis hem dusus yonundeki hareketler icin SIMETRIK calisir --
+    # eskiden sadece asiri ALIM (RSI>=75) kontrol ediliyordu, dusus
+    # yonundeki hareketler (RSI dusuk) hep 'BELIRSIZ' cikiyordu. Artik
+    # ikisi de 'asiri' sayiliyor, sadece metin farkli (alim/satim).
+    is_rsi_overbought = short_rsi is not None and short_rsi >= 75
+    is_rsi_oversold = short_rsi is not None and short_rsi <= 25
+    is_rsi_extreme = is_rsi_overbought or is_rsi_oversold
+    rsi_extreme_text = "asiri alim" if is_rsi_overbought else "asiri satim"
     is_old = breakout_age is not None and breakout_age >= 120  # 2 saatten fazla suruyorsa 'eski' say
     is_fresh = breakout_age is not None and breakout_age <= 45  # 45 dakikadan azsa 'taze' say
 
     if is_rsi_extreme and is_old:
         label = "UZAMIS"
         aciklama = (
-            f"Kisa vadeli RSI {short_rsi:.0f} (asiri alim) ve hareket ~{breakout_age} dakikadir "
+            f"Kisa vadeli RSI {short_rsi:.0f} ({rsi_extreme_text}) ve hareket ~{breakout_age} dakikadir "
             f"suruyor -- bu, zaten uzamis bir hareket, tukenme riski yuksek olabilir."
         )
     elif is_fresh and not is_rsi_extreme:
@@ -1114,7 +1120,7 @@ def classify_freshness(inst_id: str):
         )
     elif is_rsi_extreme:
         label = "UZAMIS"
-        aciklama = f"Kisa vadeli RSI {short_rsi:.0f} (asiri alim) -- hareketin sonuna yaklasilmis olabilir."
+        aciklama = f"Kisa vadeli RSI {short_rsi:.0f} ({rsi_extreme_text}) -- hareketin sonuna yaklasilmis olabilir."
     elif is_fresh:
         label = "TAZE"
         aciklama = f"Hareket ~{breakout_age} dakika once baslamis -- henuz erken asamada."
