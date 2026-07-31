@@ -626,6 +626,29 @@ def seed_status_route():
     return f"Durum: {durum} | Ilerleme: {s['done']}/{s['total']} | Baslangic: {s['started_at']} | Bitis: {s['finished_at']}"
 
 
+@app.route("/test_telegram")
+def test_telegram_route():
+    """
+    Telegram baglantisini GERCEK bir kirilim/hype sinyali beklemeden,
+    istenen an test etmek icin. Ayni SEED_SECRET_KEY ile korunuyor.
+    Ziyaret: https://senin-adresin/test_telegram?key=SENIN_ANAHTARIN
+    """
+    key = request.args.get("key", "")
+    if key != SEED_SECRET_KEY:
+        return "Yetkisiz -- dogru 'key' parametresini gir.", 403
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return "HATA: TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID tanimli degil.", 200
+
+    test_msg = (
+        "🧪 *TEST MESAJI*\n\n"
+        "Bu, /test_telegram adresinden manuel olarak tetiklenen bir test "
+        "mesajidir. Bu mesaji goruyorsan, Telegram baglantisi calisiyor demektir."
+    )
+    send_telegram_alert(test_msg)
+    return "Test mesaji gonderildi. Telegram'ini kontrol et. Gelmezse Render/VPS loglarinda 'Telegram API Hatasi' ara.", 200
+
+
 def run_flask():
     """Render'ın atadığı PORT üzerinden Flask sunucusunu başlatır."""
     port = int(os.environ.get("PORT", 10000))
@@ -693,9 +716,14 @@ ALERT_COOLDOWN_HOURS = 6.0
 BREAKOUT_LOOKBACK_HOURS = 10             # kac saatlik mum konsolidasyon penceresi olarak alinir
 BREAKOUT_RANGE_MAX_PCT = 12.0             # bu yuzdenin uzerindeki genis araliklar 'konsolidasyon' sayilmaz
 BREAKOUT_VOLUME_MULTIPLIER = 2.0          # kirilim mumunun hacmi, pencere ortalamasinin bu katini gecmeli
-BREAKOUT_PREFILTER_VOLUME_RATIO = 1.5     # bu hacim oranini gecen coinler icin (ucuz, DB'den) pahali
-                                            # Bybit kontrolu (kirilim tespiti) calistirilir -- 800 coin
-                                            # icin degil, sadece zaten hafif ilgi gosterenler icin
+BREAKOUT_PREFILTER_VOLUME_RATIO = 1.5     # (kullaniliyor, ama ARTIK TEK basina yeterli degil --
+                                            # asagidaki BREAKOUT_PREFILTER_PRICE_CHANGE_PCT ile OR mantigi var)
+BREAKOUT_PREFILTER_PRICE_CHANGE_PCT = 5.0  # YENI: bizim DB'mize hic bagimli olmayan, Bybit'in
+                                            # DOGRUDAN verdigi 24s fiyat degisimi esigi. Boylece
+                                            # coin'in baseline'i (bizim veritabanimiz) henuz olgunlasmamis
+                                            # olsa bile, gercekten hareket eden bir coin kirilim kontrolune
+                                            # girebilir -- kirilim sisteminin KENDI VERITABANIMIZDAN
+                                            # BAGIMSIZ calisma amacini gercekten yerine getirir.
 BREAKOUT_ALERT_COOLDOWN_HOURS = 4.0        # ayri bir cooldown -- ana hype alarmindan bagimsiz
 
 
@@ -1495,13 +1523,21 @@ def run_scanner():
             all_results.append(obs_data)
 
             # --- YENI: Kirilim sinyali (ana hype sistemine PARALEL, bagimsiz) ---
-            # Sadece hafif bir on-filtreyi (ucuz, kendi DB'mizden) gecen coinler
-            # icin pahali Bybit kontrolu (kirilim tespiti) calistiriyoruz --
-            # 750+ coin icin degil, sadece zaten bir miktar ilgi gorenler icin.
+            # YENI MANTIK: iki yoldan biri yeterli --
+            # (a) kendi DB'mizdeki hacim orani esigi gecerse (eskisi gibi), YA DA
+            # (b) Bybit'in DOGRUDAN verdigi 24s fiyat degisimi esigi gecerse
+            #     (DB'ye HIC bagimli degil -- coin'in baseline'i henuz olgun
+            #     olmasa bile, gercekten hareket eden coin kacirilmasin diye).
+            # Bu, kirilim sisteminin GERCEKTEN kendi veritabanimizdan bagimsiz
+            # calisma amacini yerine getiriyor.
             try:
+                volume_prefilter_passed = (
+                    volume_ratio is not None and volume_ratio >= BREAKOUT_PREFILTER_VOLUME_RATIO
+                )
+                price_prefilter_passed = abs(change_24h_pct) >= BREAKOUT_PREFILTER_PRICE_CHANGE_PCT
+
                 if (
-                    volume_ratio is not None
-                    and volume_ratio >= BREAKOUT_PREFILTER_VOLUME_RATIO
+                    (volume_prefilter_passed or price_prefilter_passed)
                     and not is_recently_notified_breakout(inst_id)
                 ):
                     breakout_info = detect_range_breakout(inst_id)
