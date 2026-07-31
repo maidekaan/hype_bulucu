@@ -706,6 +706,15 @@ FRESHNESS_CHECK_VOLUME_RATIO = 2.5   # hacim orani bu degeri gecince (ekstra API
 # birkac gunluk gercek veriyle (Telegram/veritabani) kalibre edilmesi onerilir.
 ALERT_POWER_SCORE_THRESHOLD = 6.0
 
+# --- YENI: Buyuk mutlak fiyat hareketi icin BAGIMSIZ, ikinci bir alarm yolu ---
+# Sorun: hacim orani formulu (yukaridaki), zaten devasa gunluk ciroya sahip
+# likit coinlerde (orn SNXXUSDT) BUYUK fiyat hareketlerini (orn %64) bile
+# kacirabiliyor -- cunku "kendi normaline gore" oran kucuk kalabiliyor.
+# Bu yuzden: fiyat degisimi kendi basina COK buyukse (asagidaki esik),
+# hacim orani/skor ne olursa olsun ayrica alarm veriliyor. Ayni cooldown
+# mekanizmasini (is_recently_notified) kullanir -- spam olmaz.
+BIG_MOVE_PRICE_CHANGE_PCT = 40.0
+
 ALERT_COOLDOWN_HOURS = 6.0
 
 # --- YENI: Konsolidasyon + Hacimli Kirilim Sinyali (ayri, paralel bir katman) ---
@@ -1187,6 +1196,7 @@ def detect_range_breakout(symbol: str):
     """
     bars = fetch_klines_generic(symbol, interval="60", limit=BREAKOUT_LOOKBACK_HOURS + 2)
     if bars is None or len(bars) < BREAKOUT_LOOKBACK_HOURS + 1:
+        logging.info(f"[Kirilim Teshis] {symbol}: yeterli 1 saatlik mum verisi yok, atlaniyor.")
         return None
 
     breakout_bar = bars[-1]  # Bybit sadece KAPANMIS mumlari dondurur
@@ -1199,6 +1209,10 @@ def detect_range_breakout(symbol: str):
 
     range_width_pct = (range_high - range_low) / range_low * 100.0
     if range_width_pct > BREAKOUT_RANGE_MAX_PCT:
+        logging.info(
+            f"[Kirilim Teshis] {symbol}: aralik cok genis (%{range_width_pct:.1f}, "
+            f"limit %{BREAKOUT_RANGE_MAX_PCT}) -- konsolidasyon sayilmadi."
+        )
         return None  # cok genis, konsolidasyon sayilmaz
 
     range_avg_turnover = sum(b["turnover"] for b in range_bars) / len(range_bars)
@@ -1213,6 +1227,16 @@ def detect_range_breakout(symbol: str):
         direction = "DOWN"
 
     if direction is None:
+        if breakout_bar["close"] > range_high or breakout_bar["close"] < range_low:
+            logging.info(
+                f"[Kirilim Teshis] {symbol}: fiyat araligi kirmis (dar araligi: %{range_width_pct:.1f}) "
+                f"AMA hacim yetersiz ({volume_ratio:.2f}x, gereken {BREAKOUT_VOLUME_MULTIPLIER}x) -- reddedildi."
+            )
+        else:
+            logging.info(
+                f"[Kirilim Teshis] {symbol}: dar aralikta (%{range_width_pct:.1f}) ama henuz kirilim yok "
+                f"(kapanis {breakout_bar['close']:.6g}, aralik {range_low:.6g}-{range_high:.6g})."
+            )
         return None
 
     return {
@@ -1555,9 +1579,13 @@ def run_scanner():
             except Exception as e:
                 logging.error(f"{inst_id} kirilim tespiti hatasi: {e}")
 
+            score_path_passed = (
+                final_score is not None and final_score >= ALERT_POWER_SCORE_THRESHOLD
+            )
+            big_move_path_passed = abs(change_24h_pct) >= BIG_MOVE_PRICE_CHANGE_PCT
+
             should_notify = (
-                final_score is not None
-                and final_score >= ALERT_POWER_SCORE_THRESHOLD
+                (score_path_passed or big_move_path_passed)
                 and not is_recently_notified(inst_id)
             )
 
@@ -1631,13 +1659,15 @@ def run_scanner():
             msg += f"• Fiyat: `{a['price']}`\n"
             msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
             msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-            msg += f"• Hacim Orani (normale gore): `{a['volume_ratio']:.2f}x`\n"
+            vr_str = f"{a['volume_ratio']:.2f}x" if a["volume_ratio"] is not None else "n/a (yeterli gecmis yok)"
+            msg += f"• Hacim Orani (normale gore): `{vr_str}`\n"
             msg += f"• Hacim İvmesi (kisa vade): `{a['freshness']:.2f}x`\n"
             if a["oi_change_pct"] is not None:
                 msg += f"• OI Değişimi (24s): `%{a['oi_change_pct']:.1f}`\n"
             if a["cvd_ratio"] is not None:
                 msg += f"• Alış Oranı (CVD): `%{a['cvd_ratio']*100:.0f}`\n"
-            msg += f"• *Final Skor:* `{a['score']:.1f}`\n"
+            score_str = f"{a['score']:.1f}" if a["score"] is not None else "n/a (BUYUK HAREKET yolu ile geldi)"
+            msg += f"• *Final Skor:* `{score_str}`\n"
             msg += f"📝 _{a['yorum']}_\n\n"
 
         send_telegram_alert(msg)
