@@ -27,10 +27,6 @@ def health_check():
 # ---------------------------------------------------------------------------
 # HIZLI TEKNIK OZET ARACI (/analiz sayfasi)
 # ---------------------------------------------------------------------------
-# Bu bolum, ana tarama motoruna (run_scanner, main_loop) HICBIR sekilde
-# dokunmaz -- sadece ayni Flask sunucusuna EK bir sayfa ekler. Telefondan
-# https://senin-render-adresin.onrender.com/analiz adresini acip coin
-# yazarak calistirilir.
 
 def calculate_sma(closes, period):
     if len(closes) < period:
@@ -110,12 +106,6 @@ def find_support_resistance(highs, lows, lookback=30):
 
 
 def fetch_daily_klines(symbol: str, limit: int = 250):
-    """
-    Bybit'ten gunluk mum verisi ceker, KRONOLOJIK (en eski once) sirada
-    dondurur -- Bybit API'si aksi yonde (en yeni once) verdigi icin ters
-    ceviriyoruz.
-    Donus: (closes, highs, lows, turnovers) listeleri, hepsi ayni sirada.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/kline"
     r = requests.get(
         url, params={"category": "linear", "symbol": symbol, "interval": "D", "limit": limit},
@@ -127,7 +117,7 @@ def fetch_daily_klines(symbol: str, limit: int = 250):
     raw = data.get("result", {}).get("list", [])
     if not raw:
         raise RuntimeError(f"'{symbol}' icin veri bulunamadi -- sembol adini kontrol et (orn BTCUSDT).")
-    raw = list(reversed(raw))  # kronolojik siraya cevir
+    raw = list(reversed(raw))
     closes = [float(c[4]) for c in raw]
     highs = [float(c[2]) for c in raw]
     lows = [float(c[3]) for c in raw]
@@ -136,12 +126,6 @@ def fetch_daily_klines(symbol: str, limit: int = 250):
 
 
 def get_funding_rate(symbol: str):
-    """
-    Bybit'in ticker cevabinda ZATEN gelen funding rate degerini ceker
-    (ekstra endpoint gerekmiyor). Asiri pozitif/negatif funding rate,
-    piyasanin cok agresif long/short'a yuklendigini gosterir -- genelde
-    siddetli tersine donuslerden once gorulur.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     r = requests.get(url, params={"category": "linear", "symbol": symbol}, timeout=10)
     data = r.json()
@@ -157,10 +141,6 @@ def get_funding_rate(symbol: str):
 
 
 def get_long_short_ratio(symbol: str):
-    """
-    Bybit kullanicilarinin gercek long/short pozisyon oranini ceker.
-    Donus: {'buy_ratio': 0.0-1.0, 'sell_ratio': 0.0-1.0} ya da None.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/account-ratio"
     r = requests.get(
         url, params={"category": "linear", "symbol": symbol, "period": "1h", "limit": 1},
@@ -179,12 +159,6 @@ def get_long_short_ratio(symbol: str):
 
 
 def compute_volume_comparison(turnovers):
-    """
-    Gunluk mum verisindeki ciro listesinden, SON GUNU disleyerek (kendi
-    baseline'ini kirletmesin diye) gecmis ortalamayi hesaplar, son gunun
-    cirosunu bu ortalamayla kiyaslar.
-    Donus: {'today': X, 'avg_before': Y, 'ratio': Z} ya da None.
-    """
     if len(turnovers) < 6:
         return None
     today = turnovers[-1]
@@ -196,12 +170,6 @@ def compute_volume_comparison(turnovers):
 
 
 def get_coingecko_market_data(symbol: str):
-    """
-    Bybit sembolunden (orn 'BTCUSDT') taban varlik ismini cikarip (BTC),
-    CoinGecko'da arayip market cap / dolasimdaki arz bilgisini ceker.
-    DIKKAT: sembol eslestirmesi bazi kucuk/yeni coinler icin basarisiz
-    olabilir -- bu durumda None doner, hata firlatmaz (sayfa cokmez).
-    """
     base = symbol.replace("USDT", "").strip()
     if not base:
         return None
@@ -210,8 +178,6 @@ def get_coingecko_market_data(symbol: str):
         r = requests.get(search_url, params={"query": base}, headers=COINGECKO_HEADERS, timeout=8)
         data = r.json()
         coins = data.get("coins", [])
-        # Sembolu TAM eslesen ilk sonucu tercih et (en alakali coin genelde
-        # arama sonuclarinin basinda gelir, CoinGecko piyasa degerine gore siraliyor)
         exact_matches = [c for c in coins if c.get("symbol", "").upper() == base.upper()]
         candidate = exact_matches[0] if exact_matches else (coins[0] if coins else None)
         if not candidate:
@@ -244,15 +210,6 @@ _trending_cache = {"symbols": set(), "fetched_at": 0}
 
 
 def get_coingecko_trending(cache_seconds: int = 600):
-    """
-    CoinGecko'da son 24 saatte en cok ARANAN (trend olan) coinlerin
-    sembol listesini ceker (buyuk harfle, orn {'BTC','PEPE',...}).
-    Bu, "gercekten hype yapan" coinleri, sadece bizim hacim taramamiza
-    degil, CoinGecko'nun kendi arama verisine gore de TEYIT etmemizi saglar.
-
-    Kucuk bir cache var (varsayilan 10 dakika) -- her tarama turunda
-    gereksiz yere ayni istegi tekrar tekrar atmamak icin.
-    """
     now = time.time()
     if now - _trending_cache["fetched_at"] < cache_seconds and _trending_cache["symbols"]:
         return _trending_cache["symbols"]
@@ -274,16 +231,10 @@ def get_coingecko_trending(cache_seconds: int = 600):
         return symbols
     except Exception as e:
         logging.error(f"[CoinGecko Trending] hata: {e}")
-        return _trending_cache["symbols"]  # basarisiz olursa eski (varsa) veriyi kullan
+        return _trending_cache["symbols"]
 
 
 def generate_technical_summary(symbol: str):
-    """
-    Bir coin icin RSI/MA/MACD/ATR/destek-direnc + CVD/hacim/funding/long-short/
-    market cap hesaplayip okunabilir bir Turkce ozet uretir. Bu bir
-    tahmin/tavsiye/TP hedefi DEGILDIR -- sadece mevcut teknik durumun
-    okunabilir bir ozetidir, karar tamamen kullanicinin.
-    """
     closes, highs, lows, turnovers = fetch_daily_klines(symbol)
     last_price = closes[-1]
 
@@ -296,8 +247,6 @@ def generate_technical_summary(symbol: str):
     levels = find_support_resistance(highs, lows, lookback=30)
     volume_cmp = compute_volume_comparison(turnovers)
 
-    # Bu veri kaynaklari basarisiz olsa bile (agsal hata, sembol eslesmedi vb.)
-    # sayfa COKMEMELI -- her biri kendi try/except'i ile korunuyor.
     try:
         cvd_ratio = get_cvd_buy_ratio(symbol)
     except Exception:
@@ -517,14 +466,6 @@ def analiz_page():
     return ANALIZ_SAYFA_TEMPLATE.format(symbol_value=symbol, results=results_html)
 
 
-# ---------------------------------------------------------------------------
-# BASELINE DOLDURMA (7 saatlik bekleme yerine GERCEK gecmis veriyle hizli baslangic)
-# ---------------------------------------------------------------------------
-# Bu bolum de ana tarama motoruna (run_scanner) DOKUNMAZ -- sadece ayni
-# veritabanina, Bybit'in GERCEK 14 gunluk hacim gecmisine dayanarak baseline
-# kayitlari ekler. Boylece get_average_turnover() ilk taramadan itibaren
-# gecerli bir baseline bulabilir, 7 saat beklemeye gerek kalmaz.
-
 _seed_status = {"running": False, "done": 0, "total": 0, "started_at": None, "finished_at": None}
 
 
@@ -557,15 +498,11 @@ def _run_baseline_seeding():
             if len(klines) < 5:
                 continue
 
-            # Bybit kline formati: [start, open, high, low, close, volume, turnover]
             turnovers = [float(k[6]) for k in klines if float(k[6]) > 0]
             if len(turnovers) < 5:
                 continue
             avg_turnover = sum(turnovers) / len(turnovers)
 
-            # BASELINE_MIN_SAMPLES + pay kadar kayit ekle, hepsi
-            # BASELINE_EXCLUDE_RECENT_HOURS'un OTESINE (yani 'gecerli baseline'
-            # sayilacak bolgeye) yayilmis zaman damgalariyla.
             n_rows = BASELINE_MIN_SAMPLES + 10
             for i in range(n_rows):
                 ts = (
@@ -585,7 +522,7 @@ def _run_baseline_seeding():
             logging.error(f"[Seed] {symbol} hata: {e}")
 
         _seed_status["done"] += 1
-        time.sleep(0.1)  # Bybit rate-limit'ine karsi kibar davran
+        time.sleep(0.1)
 
     conn.close()
     _seed_status["running"] = False
@@ -595,12 +532,6 @@ def _run_baseline_seeding():
 
 @app.route("/seed_baseline")
 def seed_baseline_route():
-    """
-    Telefondan/tarayicidan bir kez ziyaret edilir:
-    https://senin-adresin.onrender.com/seed_baseline?key=GIZLI_ANAHTARIN
-    Arka planda calisir (birkac dakika surer), sayfa hemen doner.
-    Ilerlemeyi /seed_status adresinden takip edebilirsin.
-    """
     key = request.args.get("key", "")
     if key != SEED_SECRET_KEY:
         return "Yetkisiz -- dogru 'key' parametresini gir.", 403
@@ -628,11 +559,6 @@ def seed_status_route():
 
 @app.route("/test_telegram")
 def test_telegram_route():
-    """
-    Telegram baglantisini GERCEK bir kirilim/hype sinyali beklemeden,
-    istenen an test etmek icin. Ayni SEED_SECRET_KEY ile korunuyor.
-    Ziyaret: https://senin-adresin/test_telegram?key=SENIN_ANAHTARIN
-    """
     key = request.args.get("key", "")
     if key != SEED_SECRET_KEY:
         return "Yetkisiz -- dogru 'key' parametresini gir.", 403
@@ -650,7 +576,6 @@ def test_telegram_route():
 
 
 def run_flask():
-    """Render'ın atadığı PORT üzerinden Flask sunucusunu başlatır."""
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
@@ -660,88 +585,67 @@ def run_flask():
 # ---------------------------------------------------------------------------
 DB_PATH = "hype_history.db"
 
-# Bybit'in resmi alternatif alan adi -- Render'dan test edilip sorunsuz
-# calistigi kanitlandi (bkz. daha onceki deploy loglari).
 BYBIT_BASE_URL = "https://api.bytick.com"
 
-# /seed_baseline adresini yetkisiz kullanimdan korumak icin basit bir anahtar.
-# Render'da Environment Variable olarak SEED_SECRET_KEY tanimlayip kendi
-# gizli degerini belirlemen onerilir -- tanimlamazsan varsayilan kullanilir
-# (herkese acik URL oldugu icin bunu degistirmen guvenlik acisindan iyi olur).
 SEED_SECRET_KEY = os.environ.get("SEED_SECRET_KEY", "degistir-bu-anahtari")
 
-# CoinGecko Demo API Key -- market cap ve trending ozellikleri icin.
-# 2026'da CoinGecko ucretsiz kullanim icin bile bu key'i zorunlu kildi.
-# Render'da Environment Variable olarak COINGECKO_API_KEY tanimlaman gerekiyor.
 COINGECKO_API_KEY = os.environ.get("COINGECKO_API_KEY", "")
 COINGECKO_HEADERS = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
 
 SCAN_INTERVAL_SECONDS = 900
 
-# --- 4 saatlik ozet raporu ayarlari ---
-REPORT_INTERVAL_SECONDS = 4 * 3600     # her 4 saatte bir ozet raporu gonder
-REPORT_MIN_MOVE_PCT = 10.0              # rapora girecek min. 4 saatlik hareket yuzdesi
-REPORT_MAX_ITEMS_SHOWN = 15             # mesajda en fazla kac coin listelenecek (uzun mesaj limiti icin)
+REPORT_INTERVAL_SECONDS = 4 * 3600
+REPORT_MIN_MOVE_PCT = 10.0
+REPORT_MAX_ITEMS_SHOWN = 15
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MIN_TURNOVER_24H = 300_000.0
 
-# --- YENI FORMUL: HACIM ANA BELIRLEYICI, FIYAT DEGISIMI IKINCIL/TEYIT EDICI ---
-# Eskiden: power_score = |fiyat_degisimi| * log10(hacim)  -- fiyat agirlikliydi.
-# Simdi:   power_score = hacim_orani * (1 + |fiyat_degisimi|/100)
-# hacim_orani = bu coinin GUNCEL cirosu / KENDI GECMIS ORTALAMA cirosu.
-# Bu, "coin normalin kac kati hacim goruyor" sorusuna cevap veriyor -- BTC/ETH
-# gibi zaten hacimli coinlerin sirf buyuk olduklari icin one cikmasini onluyor,
-# cunku artik mutlak hacim degil, KENDI NORMALINE GORE oran onemli.
-BASELINE_MIN_SAMPLES = 20          # bu kadar gecmis kayit yoksa 'yetersiz veri' sayilir, alarm verilmez
-BASELINE_EXCLUDE_RECENT_HOURS = 2.0  # son X saat baseline'a DAHIL EDILMEZ (guncel spike kendi
-                                      # baseline'ini kirletmesin diye -- backtest.py'deki ayni prensip)
-FRESHNESS_CHECK_VOLUME_RATIO = 2.5   # hacim orani bu degeri gecince (ekstra API cagrisi gerektiren)
-                                       # tazelik kontrolu calistirilir
+BASELINE_MIN_SAMPLES = 20
+BASELINE_EXCLUDE_RECENT_HOURS = 2.0
+FRESHNESS_CHECK_VOLUME_RATIO = 2.5
 
-# NOT: Skor olcegi tamamen degisti (eskiden 60-2000 araligindaydi, simdi
-# tipik olarak 1-30 araliginda olacak). Bu esik BASLANGIC degeridir --
-# birkac gunluk gercek veriyle (Telegram/veritabani) kalibre edilmesi onerilir.
 ALERT_POWER_SCORE_THRESHOLD = 6.0
 
-# --- YENI: Buyuk mutlak fiyat hareketi icin BAGIMSIZ, ikinci bir alarm yolu ---
-# Sorun: hacim orani formulu (yukaridaki), zaten devasa gunluk ciroya sahip
-# likit coinlerde (orn SNXXUSDT) BUYUK fiyat hareketlerini (orn %64) bile
-# kacirabiliyor -- cunku "kendi normaline gore" oran kucuk kalabiliyor.
-# Bu yuzden: fiyat degisimi kendi basina COK buyukse (asagidaki esik),
-# hacim orani/skor ne olursa olsun ayrica alarm veriliyor. Ayni cooldown
-# mekanizmasini (is_recently_notified) kullanir -- spam olmaz.
 BIG_MOVE_PRICE_CHANGE_PCT = 40.0
 
 ALERT_COOLDOWN_HOURS = 6.0
 
-# --- YENI: Konsolidasyon + Hacimli Kirilim Sinyali (ayri, paralel bir katman) ---
-# Mantik: 1 saatlik mumlarla son N mumu 'konsolidasyon araligi' olarak al,
-# aralik yeterince DAR mi kontrol et, sonra EN SON KAPANMIS mumun bu araligi
-# HACIMLI sekilde kapanisla kirip kirmadigina bak. 5 dakikalik mumlarla da
-# kirilimin 'sahte' (fake breakout/fitil) olmadigini teyit et.
-BREAKOUT_LOOKBACK_HOURS = 10             # kac saatlik mum konsolidasyon penceresi olarak alinir
-BREAKOUT_RANGE_MAX_PCT = 12.0             # bu yuzdenin uzerindeki genis araliklar 'konsolidasyon' sayilmaz
-BREAKOUT_VOLUME_MULTIPLIER = 2.0          # kirilim mumunun hacmi, pencere ortalamasinin bu katini gecmeli
-BREAKOUT_PREFILTER_VOLUME_RATIO = 1.5     # (kullaniliyor, ama ARTIK TEK basina yeterli degil --
-                                            # asagidaki BREAKOUT_PREFILTER_PRICE_CHANGE_PCT ile OR mantigi var)
-BREAKOUT_PREFILTER_PRICE_CHANGE_PCT = 5.0  # YENI: bizim DB'mize hic bagimli olmayan, Bybit'in
-                                            # DOGRUDAN verdigi 24s fiyat degisimi esigi. Boylece
-                                            # coin'in baseline'i (bizim veritabanimiz) henuz olgunlasmamis
-                                            # olsa bile, gercekten hareket eden bir coin kirilim kontrolune
-                                            # girebilir -- kirilim sisteminin KENDI VERITABANIMIZDAN
-                                            # BAGIMSIZ calisma amacini gercekten yerine getirir.
-BREAKOUT_ALERT_COOLDOWN_HOURS = 4.0        # ayri bir cooldown -- ana hype alarmindan bagimsiz
+BREAKOUT_LOOKBACK_HOURS = 10
+BREAKOUT_RANGE_MAX_PCT = 12.0
+BREAKOUT_VOLUME_MULTIPLIER = 2.0
+BREAKOUT_PREFILTER_VOLUME_RATIO = 1.5
+BREAKOUT_PREFILTER_PRICE_CHANGE_PCT = 5.0
+BREAKOUT_ALERT_COOLDOWN_HOURS = 4.0
 
 
-# --- YENI: OI / CVD / Tukenme kontrolu icin esikler ---
-OI_CHANGE_STRONG_PCT = 5.0        # bu yuzdenin uzerinde OI artisi 'guclu yeni pozisyon girisi' sayilir
-OI_CHANGE_WEAK_NEGATIVE_PCT = -3.0  # bu yuzdenin altinda OI dususu 'short squeeze' isareti sayilir
-CVD_BUY_STRONG = 0.60              # bu oranin uzerinde alis baskisi 'guclu' sayilir
-CVD_SELL_STRONG = 0.45             # bu oranin altinda alis orani 'zayif/satis agirlikli' sayilir
-EXHAUSTION_POSITION_THRESHOLD = 0.90  # 24s bandinin bu orani uzerindeyse 'zirveye yakin' sayilir
+OI_CHANGE_STRONG_PCT = 5.0
+OI_CHANGE_WEAK_NEGATIVE_PCT = -3.0
+CVD_BUY_STRONG = 0.60
+CVD_SELL_STRONG = 0.45
+EXHAUSTION_POSITION_THRESHOLD = 0.90
+
+# --- YENI (Madde 1): Tukenme/ters donus bolgesinde ana sinyali TAMAMEN BASTIR ---
+# RSI asiri + hareket eski + CVD uyumsuzlugu ayni anda varsa, bu "giris" degil
+# "cikis/tersine donus" bolgesidir -- Burakcan'in notuna gore boyle bir durumda
+# "HYPE" diye bildirim gondermek yaniltici, o yuzden TAMAMEN BASTIRILIYOR
+# (hem skor yolu hem buyuk hareket yolu icin).
+
+# --- YENI (Madde 3): Funding rate esikleri (ana taramada da kullanilacak) ---
+FUNDING_EXTREME_POS_PCT = 0.05   # /analiz sayfasindaki esikle tutarli
+FUNDING_EXTREME_NEG_PCT = -0.05
+FUNDING_HISTORY_LOOKBACK_HOURS = 6.0  # "son 4-8 saatteki degisim" icin kullanilan pencere
+
+# --- YENI (Madde 4): "Guclu Setup" vurgusu icin esikler ---
+STRONG_SETUP_RSI_MAX = 60.0
+STRONG_SETUP_CVD_MIN = 0.65
+
+# --- YENI (Madde 6): Funding asiriligi bazli AYRI, paralel bir tarama ---
+FUNDING_SCAN_EXTREME_PCT = 0.05          # bu yuzdenin uzerindeki/altindaki funding 'asiri' sayilir
+FUNDING_SCAN_MIN_PRICE_MOVE_PCT = 10.0    # fiyat da bu kadar hareket etmis olmali
+FUNDING_SCAN_COOLDOWN_HOURS = 6.0         # ayri bir cooldown -- diger sinyallerden bagimsiz
 
 logging.basicConfig(
     level=logging.INFO,
@@ -755,9 +659,6 @@ logging.basicConfig(
 
 
 def init_db():
-    """SQLite veritabani ve gerekli tablo yoksa olusturur. Var olan eski
-    tablolara (Render'da zaten calisan onceki surumden kalma) yeni sutunlari
-    guvenli sekilde ekler -- mevcut veriyi kaybetmeden."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -778,8 +679,6 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_inst_time ON hype_observations (inst_id, timestamp)"
     )
 
-    # YENI: Kirilim sinyali icin tamamen AYRI bir tablo -- mevcut
-    # hype_observations tablosuna hic dokunmuyor, sifir risk.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS breakout_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -792,6 +691,19 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_breakout_inst_time ON breakout_alerts (inst_id, timestamp)"
     )
 
+    # YENI (Madde 6): Funding asiriligi sinyali icin AYRI bir tablo --
+    # kirilim tablosuyla ayni desen, sifir risk.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS funding_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            inst_id TEXT NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_funding_inst_time ON funding_alerts (inst_id, timestamp)"
+    )
+
     for col_def in [
         "oi_value REAL",
         "oi_change_pct REAL",
@@ -799,6 +711,7 @@ def init_db():
         "position_in_range REAL",
         "yorum TEXT",
         "volume_ratio REAL",
+        "funding_rate REAL",
     ]:
         try:
             cursor.execute(f"ALTER TABLE hype_observations ADD COLUMN {col_def}")
@@ -818,8 +731,8 @@ def record_observation(data: dict):
             timestamp, inst_id, last_price, change_24h_pct, turnover_24h,
             power_score, freshness_ratio, final_score, notified,
             oi_value, oi_change_pct, cvd_buy_ratio, position_in_range, yorum,
-            volume_ratio
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            volume_ratio, funding_rate
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
             data["timestamp"],
@@ -837,6 +750,7 @@ def record_observation(data: dict):
             data.get("position_in_range"),
             data.get("yorum"),
             data.get("volume_ratio"),
+            data.get("funding_rate"),
         ),
     )
     conn.commit()
@@ -862,10 +776,6 @@ def is_recently_notified(inst_id: str) -> bool:
 
 
 def get_previous_oi(inst_id: str):
-    """
-    Yaklasik 24 saat once kaydedilmis OI degerini bulur (bu coin daha once
-    kisa listeye girmisse). Bulamazsa None doner.
-    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=23)).isoformat()
@@ -882,17 +792,29 @@ def get_previous_oi(inst_id: str):
     return row[0] if row and row[0] else None
 
 
-def get_average_turnover(inst_id: str):
+def get_previous_funding_rate(inst_id: str, hours_ago: float = FUNDING_HISTORY_LOOKBACK_HOURS):
     """
-    Bu coin icin KENDI GECMISINDEKI ortalama 24s ciroyu hesaplar -- yeni
-    hacim-odakli formulun temeli. Guncel spike'in kendi baseline'ini
-    kirletmemesi icin son BASELINE_EXCLUDE_RECENT_HOURS saat DISLANIR
-    (backtest.py'de kullandigimiz ayni prensip).
+    YENI (Madde 3): Yaklasik 'hours_ago' saat once kaydedilmis funding rate
+    degerini bulur -- "son 4-8 saatteki degisim" hesaplamak icin. Kendi
+    veritabanimizdan, ayni get_previous_oi mantigiyla.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_ago + 0.5)).isoformat()
+    cursor.execute(
+        """
+        SELECT funding_rate FROM hype_observations
+        WHERE inst_id = ? AND funding_rate IS NOT NULL AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 1
+    """,
+        (inst_id, cutoff),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else None
 
-    Yeterli gecmis (en az BASELINE_MIN_SAMPLES kayit) yoksa None doner --
-    bu durumda bu coin icin guvenilir bir hacim orani hesaplanamaz ve
-    coin alarma dahil edilmez (yanlis pozitif riskini onlemek icin).
-    """
+
+def get_average_turnover(inst_id: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cutoff = (
@@ -964,11 +886,6 @@ def send_telegram_alert(message: str):
 
 
 def get_bybit_tickers():
-    """
-    Bybit'in TUM linear (USDT vadeli islem) coinlerinin 24s ozetini TEK
-    istekte ceker. OKX'ten farkli olarak Bybit'in ticker cevabi Open
-    Interest'i de ICINDE veriyor -- ayri bir OI istegi hic gerekmiyor.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     try:
         response = requests.get(url, params={"category": "linear"}, timeout=15)
@@ -983,14 +900,6 @@ def get_bybit_tickers():
 
 
 def get_all_open_interest(tickers):
-    """
-    Bybit'te OI, ticker cevabinin ICINDE zaten geliyor -- OKX'teki gibi
-    AYRI bir istek yapmaya gerek yok. Bu fonksiyon sadece zaten elimizde
-    olan ticker listesinden OI degerlerini cikarip sozluk haline getirir
-    (kod akisini ve log mesajlarini eskisiyle tutarli tutmak icin ayri
-    fonksiyon olarak birakildi).
-    Donus: {symbol: oi_degeri} seklinde sozluk.
-    """
     result = {}
     for item in tickers:
         try:
@@ -1004,20 +913,6 @@ def get_all_open_interest(tickers):
 
 
 def fetch_recent_klines_short(inst_id: str, interval: str = "15", limit: int = 30):
-    """
-    Bybit'ten KISA VADELI (varsayilan 15 dakikalik) mum verisi ceker,
-    KRONOLOJIK (en eski once) sirada dondurur.
-    Bu, "hareket ne zaman basladi, hala hizlaniyor mu" sorusuna cevap
-    vermek icin kullanilir -- gunluk mumlardan cok daha hassas bir
-    zaman cozunurlugu saglar (30 mum x 15dk = ~7.5 saatlik pencere).
-
-    Kendi veritabanimiza IHTIYAC DUYMAZ -- Bybit'in kendi gecmis
-    mumlarindan anlik olarak cekilir, bu yuzden yeni deploy sonrasi
-    bekleme suresi gerektirmez.
-
-    Donus: (closes, turnovers) listeleri, kronolojik sirada. Basarisiz
-    olursa (None, None) doner -- cagiran kod bunu kontrol etmeli.
-    """
     try:
         url = f"{BYBIT_BASE_URL}/v5/market/kline"
         r = requests.get(
@@ -1030,7 +925,7 @@ def fetch_recent_klines_short(inst_id: str, interval: str = "15", limit: int = 3
         raw = data.get("result", {}).get("list", [])
         if len(raw) < 5:
             return None, None
-        raw = list(reversed(raw))  # kronolojik siraya cevir
+        raw = list(reversed(raw))
         closes = [float(c[4]) for c in raw]
         turnovers = [float(c[6]) for c in raw]
         return closes, turnovers
@@ -1040,21 +935,6 @@ def fetch_recent_klines_short(inst_id: str, interval: str = "15", limit: int = 3
 
 
 def find_breakout_start_minutes_ago(turnovers, bar_minutes: int = 15, volume_multiplier: float = 2.5, baseline_bars: int = 8):
-    """
-    Kisa vadeli ciro listesinde, hangi bardan itibaren hacmin, pencerenin
-    EN ESKI 'baseline_bars' barinin ortalamasini 'volume_multiplier' katini
-    surekli astigini bulur. Bu, "hareket kac dakikadir suruyor" sorusuna
-    cevap verir.
-
-    ONEMLI: Baseline, TUM pencerenin ortalamasi DEGIL, sadece pencerenin
-    EN BASINDAKI birkaç bar -- eger patlama pencerenin yarisindan fazlasini
-    kapliyorsa, tum pencere ortalamasi kendi kendini kirletir (patlamanin
-    kendisi 'normal' sanilir). Bu yuzden sadece en eski (muhtemelen
-    patlama-oncesi) barlari referans aliyoruz.
-
-    turnovers: KRONOLOJIK sirada (en eski once) ciro listesi.
-    Donus: dakika cinsinden sure (int) ya da tespit edilemezse None.
-    """
     if len(turnovers) < baseline_bars + 3:
         return None
     baseline_segment = turnovers[:baseline_bars]
@@ -1076,18 +956,6 @@ def find_breakout_start_minutes_ago(turnovers, bar_minutes: int = 15, volume_mul
 
 
 def classify_freshness(inst_id: str):
-    """
-    Kisa vadeli (15 dakikalik) veriye bakarak bu hareketin TAZE mi yoksa
-    zaten UZAMIS mi oldugunu belirler. Bu, "coin sinyale geldiginde zaten
-    %25 yukselmis, ama bu YENI mi baslamis yoksa saatlerdir mi suruyor"
-    sorusuna canli olarak cevap verir.
-
-    Bu fonksiyon SADECE alarm gonderilecek adaylar icin cagrilir (tum
-    piyasa icin degil) -- gereksiz API yukunu onlemek adina.
-
-    Donus: {'label': 'TAZE'/'UZAMIS'/'BELIRSIZ', 'short_rsi': float/None,
-            'breakout_age_minutes': int/None, 'aciklama': str}
-    """
     closes, turnovers = fetch_recent_klines_short(inst_id, interval="15", limit=30)
 
     if closes is None or len(closes) < 15:
@@ -1101,18 +969,12 @@ def classify_freshness(inst_id: str):
     short_rsi = calculate_rsi(closes, period=14)
     breakout_age = find_breakout_start_minutes_ago(turnovers, bar_minutes=15)
 
-    # Karar mantigi: RSI COK yuksek (asiri alim) YA DA COK dusuk (asiri
-    # satim) VE hareket uzun suredir devam ediyorsa -> UZAMIS. Bu, hem
-    # yukselis hem dusus yonundeki hareketler icin SIMETRIK calisir --
-    # eskiden sadece asiri ALIM (RSI>=75) kontrol ediliyordu, dusus
-    # yonundeki hareketler (RSI dusuk) hep 'BELIRSIZ' cikiyordu. Artik
-    # ikisi de 'asiri' sayiliyor, sadece metin farkli (alim/satim).
     is_rsi_overbought = short_rsi is not None and short_rsi >= 75
     is_rsi_oversold = short_rsi is not None and short_rsi <= 25
     is_rsi_extreme = is_rsi_overbought or is_rsi_oversold
     rsi_extreme_text = "asiri alim" if is_rsi_overbought else "asiri satim"
-    is_old = breakout_age is not None and breakout_age >= 120  # 2 saatten fazla suruyorsa 'eski' say
-    is_fresh = breakout_age is not None and breakout_age <= 45  # 45 dakikadan azsa 'taze' say
+    is_old = breakout_age is not None and breakout_age >= 120
+    is_fresh = breakout_age is not None and breakout_age <= 45
 
     if is_rsi_extreme and is_old:
         label = "UZAMIS"
@@ -1148,13 +1010,6 @@ def classify_freshness(inst_id: str):
 
 
 def fetch_klines_generic(symbol: str, interval: str, limit: int):
-    """
-    Bybit'ten herhangi bir zaman dilimi icin mum verisi ceker, KRONOLOJIK
-    (en eski once) sirada dondurur. Genel amacli yardimci fonksiyon --
-    kirilim tespiti icin 1 saatlik ve 5 dakikalik mumlarda kullanilir.
-    Donus: [{'open','high','low','close','turnover'}, ...] ya da basarisiz
-    olursa None.
-    """
     try:
         url = f"{BYBIT_BASE_URL}/v5/market/kline"
         r = requests.get(
@@ -1180,27 +1035,13 @@ def fetch_klines_generic(symbol: str, interval: str, limit: int):
 
 
 def detect_range_breakout(symbol: str):
-    """
-    Konsolidasyon + hacimli kapanis kirilimi tespit eder (kullanicinin
-    ZIL/USDT grafik ornegindeki paterne dayanir).
-
-    1) Son BREAKOUT_LOOKBACK_HOURS saatlik mumu (kirilim mumu HARIC)
-       'konsolidasyon penceresi' olarak alir.
-    2) Bu pencerenin yeterince DAR oldugunu dogrular (cok genisse
-       zaten konsolidasyon degildir, kirilim anlamsizdir).
-    3) EN SON KAPANMIS mumun bu araligi HACIMLI sekilde kapanisla kirip
-       kirmadigina bakar.
-
-    Donus: {'direction':'UP'/'DOWN', 'breakout_close':.., 'range_high':..,
-            'range_low':.., 'volume_ratio':..} ya da None (kirilim yok).
-    """
     bars = fetch_klines_generic(symbol, interval="60", limit=BREAKOUT_LOOKBACK_HOURS + 2)
     if bars is None or len(bars) < BREAKOUT_LOOKBACK_HOURS + 1:
         logging.info(f"[Kirilim Teshis] {symbol}: yeterli 1 saatlik mum verisi yok, atlaniyor.")
         return None
 
-    breakout_bar = bars[-1]  # Bybit sadece KAPANMIS mumlari dondurur
-    range_bars = bars[-(BREAKOUT_LOOKBACK_HOURS + 1):-1]  # kirilim mumu HARIC onceki N mum
+    breakout_bar = bars[-1]
+    range_bars = bars[-(BREAKOUT_LOOKBACK_HOURS + 1):-1]
 
     range_high = max(b["high"] for b in range_bars)
     range_low = min(b["low"] for b in range_bars)
@@ -1213,7 +1054,7 @@ def detect_range_breakout(symbol: str):
             f"[Kirilim Teshis] {symbol}: aralik cok genis (%{range_width_pct:.1f}, "
             f"limit %{BREAKOUT_RANGE_MAX_PCT}) -- konsolidasyon sayilmadi."
         )
-        return None  # cok genis, konsolidasyon sayilmaz
+        return None
 
     range_avg_turnover = sum(b["turnover"] for b in range_bars) / len(range_bars)
     if range_avg_turnover <= 0:
@@ -1249,14 +1090,6 @@ def detect_range_breakout(symbol: str):
 
 
 def confirm_breakout_hold(symbol: str, direction: str, breakout_level: float):
-    """
-    Kirilimdan sonra fiyatin seviyeyi koruyup korumadigini 5 dakikalik
-    mumlarla kontrol eder -- 'sahte kirilim' (fake breakout/fitil) filtresi.
-    Kucuk bir tolerans (%0.5) payi birakilir, gurultuye karsi.
-
-    Donus: True (teyit edildi, seviye korunuyor) / False (geri donmus,
-    sahte olabilir) / None (yeterli veri yok).
-    """
     bars = fetch_klines_generic(symbol, interval="5", limit=6)
     if bars is None or len(bars) < 3:
         return None
@@ -1268,7 +1101,6 @@ def confirm_breakout_hold(symbol: str, direction: str, breakout_level: float):
 
 
 def is_recently_notified_breakout(inst_id: str) -> bool:
-    """Kirilim sinyali icin AYRI bir cooldown -- ana hype alarmindan bagimsiz."""
     conn = sqlite3.connect(DB_PATH)
     cutoff_time = (
         datetime.now(timezone.utc) - timedelta(hours=BREAKOUT_ALERT_COOLDOWN_HOURS)
@@ -1292,7 +1124,6 @@ def record_breakout_alert(inst_id: str, direction: str):
 
 
 def send_breakout_alert(inst_id: str, breakout_info: dict, hold_confirmed):
-    """Kirilim sinyalini AYRI bir Telegram mesaji olarak gonderir."""
     direction = breakout_info["direction"]
     emoji = "📈" if direction == "UP" else "📉"
     yon_text = "YUKARI KIRILIM" if direction == "UP" else "ASAGI KIRILIM (SHORT)"
@@ -1319,12 +1150,91 @@ def send_breakout_alert(inst_id: str, breakout_info: dict, hold_confirmed):
     logging.info(f"[Kirilim] {inst_id} icin {direction} kirilim sinyali gonderildi.")
 
 
+def is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio):
+    """
+    YENI (Madde 1): RSI asiri + hareket ESKI + CVD uyumsuzlugu AYNI ANDA
+    varsa, bu artik "giris" degil "cikis/ters donus" bolgesi sayilir.
+    Kararlastirildigi gibi boyle bir durumda ana HYPE sinyali TAMAMEN
+    BASTIRILIR (hem skor yolu hem buyuk hareket yolu icin) -- ayri bir
+    SHORT sinyali degil, sadece sessizce atlanir (zaten kirilim sistemi
+    ayri calisiyor).
+
+    CVD uyumsuzlugu: fiyat yukselirken CVD zayifsa (satis baskisi var),
+    ya da fiyat duserken CVD guclu alis gosteriyorsa (satis tukenmis
+    olabilir) -- ikisi de "yon ile hacim arasinda catisma var" demek.
+    """
+    if freshness_info is None:
+        return False
+    if freshness_info.get("label") != "UZAMIS":
+        return False
+    if cvd_ratio is None:
+        return False
+    yon_yukari = change_24h_pct >= 0
+    if yon_yukari:
+        return cvd_ratio <= CVD_SELL_STRONG
+    else:
+        return cvd_ratio >= CVD_BUY_STRONG
+
+
+def is_recently_notified_funding(inst_id: str) -> bool:
+    """YENI (Madde 6): Funding asiriligi sinyali icin AYRI bir cooldown."""
+    conn = sqlite3.connect(DB_PATH)
+    cutoff_time = (
+        datetime.now(timezone.utc) - timedelta(hours=FUNDING_SCAN_COOLDOWN_HOURS)
+    ).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM funding_alerts WHERE inst_id = ? AND timestamp >= ?",
+        (inst_id, cutoff_time),
+    ).fetchone()
+    conn.close()
+    return row[0] > 0
+
+
+def record_funding_alert(inst_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO funding_alerts (timestamp, inst_id) VALUES (?, ?)",
+        (datetime.now(timezone.utc).isoformat(), inst_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_funding_alert(inst_id: str, funding_pct: float, change_24h_pct: float):
+    """
+    YENI (Madde 6): Funding asiriligi bazli, ana hype sisteminden TAMAMEN
+    BAGIMSIZ, paralel bir tarama. "Funding cok yuksek/dusuk VE fiyat zaten
+    hareket etmis" durumunu yakalar -- coin hic hype sinyali vermese bile.
+    """
+    if funding_pct >= FUNDING_SCAN_EXTREME_PCT and change_24h_pct > 0:
+        emoji = "⚠️"
+        aciklama = (
+            f"Funding %{funding_pct:.3f} (asiri pozitif) + fiyat zaten %{change_24h_pct:.1f} "
+            f"yukselmis -- long tarafi kalabalik, ani bir long tasfiyesi (fiyat dususu) "
+            f"riski artmis olabilir."
+        )
+    elif funding_pct <= FUNDING_SCAN_EXTREME_PCT * -1 and change_24h_pct < 0:
+        emoji = "⚠️"
+        aciklama = (
+            f"Funding %{funding_pct:.3f} (asiri negatif) + fiyat zaten %{change_24h_pct:.1f} "
+            f"dusmus -- short tarafi kalabalik, ani bir short squeeze (fiyat sicramasi) "
+            f"riski artmis olabilir."
+        )
+    else:
+        return  # kombinasyon net degil, gonderme
+
+    msg = (
+        f"{emoji} *FUNDING ASIRILIGI* -- {inst_id}\n\n"
+        f"{aciklama}\n\n"
+        f"_Bu, ana hype sisteminden bagimsiz, sadece funding/fiyat kombinasyonuna "
+        f"dayanan ayri bir tarama. Yatirim tavsiyesi degildir._"
+    )
+    send_telegram_alert(msg)
+    record_funding_alert(inst_id)
+    logging.info(f"[Funding] {inst_id} icin funding asiriligi sinyali gonderildi.")
+
+
 def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
-    """
-    Son islemlerin ne kadarinin agresif ALIS, ne kadarinin agresif SATIS
-    oldugunu hesaplar. 0.5 dengeli, 1.0'a yaklastikca alis baskisi agir basar.
-    Sadece kisa listeye giren (esigi gecen) adaylar icin cagrilir.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/recent-trade"
     try:
         response = requests.get(
@@ -1347,11 +1257,41 @@ def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
         return None
 
 
+def get_spot_cvd_buy_ratio(inst_id: str, limit: int = 300):
+    """
+    YENI (Madde 5): Ayni hesaplamayi SPOT piyasa icin yapar (category='spot').
+    Futures CVD ile kiyaslanip "bu yukselis gercek/spot alicilardan mi,
+    yoksa sadece kaldiracli/futures kumarindan mi geliyor" ayrimini yapmak
+    icin kullanilir.
+
+    ONEMLI: Bybit'te her futures sembolunun bir spot karsiligi OLMAYABILIR
+    (bircok kucuk/yeni coin sadece vadeli islemde listelenir). Bu durumda
+    Bybit hata donuyor, biz de None donup sessizce atliyoruz -- hata
+    firlatmiyoruz, sistemi cokertmiyor.
+    """
+    url = f"{BYBIT_BASE_URL}/v5/market/recent-trade"
+    try:
+        response = requests.get(
+            url, params={"category": "spot", "symbol": inst_id, "limit": limit}, timeout=10
+        )
+        data = response.json()
+        if data.get("retCode") != 0:
+            return None  # bu sembol icin spot piyasa yok olabilir, normal
+        trades = data.get("result", {}).get("list", [])
+        if not trades:
+            return None
+        buy_vol = sum(float(t["size"]) for t in trades if t.get("side") == "Buy")
+        sell_vol = sum(float(t["size"]) for t in trades if t.get("side") == "Sell")
+        total = buy_vol + sell_vol
+        if total == 0:
+            return None
+        return buy_vol / total
+    except Exception as e:
+        logging.error(f"{inst_id} Spot CVD hesabi hatasi: {e}")
+        return None
+
+
 def calculate_freshness_ratio(inst_id: str) -> float:
-    """
-    Son 60 Günlük (2 Ay) ve Son 2 Saatlik Hacim Kıyaslaması.
-    (Mantik degismedi, sadece veri kaynagi Bybit'e cevrildi.)
-    """
     try:
         url_60d = f"{BYBIT_BASE_URL}/v5/market/kline"
         res_60d = requests.get(
@@ -1363,7 +1303,6 @@ def calculate_freshness_ratio(inst_id: str) -> float:
         if len(data_60d) < 30:
             return 1.0
 
-        # Bybit kline formati: [start, open, high, low, close, volume, turnover]
         total_60d_vol = sum([float(c[6]) for c in data_60d])
         avg_hourly_vol_60d = (total_60d_vol / len(data_60d)) / 24.0
 
@@ -1391,13 +1330,9 @@ def calculate_freshness_ratio(inst_id: str) -> float:
         return 1.0
 
 
-def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio):
-    """
-    Sayisal sinyalleri, giris karari verirken okunabilecek kisa bir
-    Turkce yorum cumlesine cevirir. Bu bir tahmin/tavsiye degildir --
-    sadece o anki teknik durumun okunabilir bir ozetidir. Skoru
-    ETKILEMEZ, sadece bilgilendirme amaclidir.
-    """
+def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio,
+                         funding_pct=None, funding_change_pct=None, spot_cvd_ratio=None,
+                         freshness_label=None, short_rsi=None):
     notlar = []
     yon_yukari = change_pct >= 0
 
@@ -1449,6 +1384,54 @@ def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range,
                 f"dusus baskisi guclu gorunuyor."
             )
 
+    # YENI (Madde 3): Funding rate + OI + fiyat kombinasyonu.
+    # Kural: Fiyat yukselirken + OI artarken + Funding NEGATIF -> mukemmel long
+    # (short squeeze potansiyeli). Fiyat yukselirken + OI artarken + Funding
+    # ASIRI POZITIF -> riskli (tepede long birikmis, patlayabilir).
+    if funding_pct is not None and oi_change_pct is not None:
+        oi_artiyor = oi_change_pct >= OI_CHANGE_STRONG_PCT
+        if yon_yukari and oi_artiyor and funding_pct <= FUNDING_EXTREME_NEG_PCT:
+            notlar.append(
+                f"Funding NEGATIF (%{funding_pct:.3f}) + OI artisi + fiyat yukselisi -- "
+                f"MUKEMMEL LONG kurulumu olabilir, short squeeze potansiyeli var."
+            )
+        elif yon_yukari and oi_artiyor and funding_pct >= FUNDING_EXTREME_POS_PCT:
+            notlar.append(
+                f"Funding ASIRI POZITIF (%{funding_pct:.3f}) -- tepede long birikmis, "
+                f"ani bir dususe (long tasfiyesi) karsi riskli olabilir."
+            )
+
+    if funding_change_pct is not None and abs(funding_change_pct) >= 0.02:
+        yon_text = "artmis" if funding_change_pct > 0 else "azalmis"
+        notlar.append(
+            f"Funding rate son ~{FUNDING_HISTORY_LOOKBACK_HOURS:.0f} saatte %{abs(funding_change_pct):.3f} {yon_text}."
+        )
+
+    # YENI (Madde 5): Spot CVD vs Futures CVD ayrimi.
+    if spot_cvd_ratio is not None and cvd_ratio is not None and yon_yukari:
+        if cvd_ratio >= CVD_BUY_STRONG and spot_cvd_ratio < 0.50:
+            notlar.append(
+                f"Futures CVD guclu (%{cvd_ratio*100:.0f}) ama Spot CVD zayif (%{spot_cvd_ratio*100:.0f}) "
+                f"-- yukselis agirlikli olarak kaldiracli (futures) pozisyonlardan geliyor, "
+                f"omru kisa olabilir."
+            )
+        elif cvd_ratio >= 0.55 and spot_cvd_ratio >= 0.55:
+            notlar.append(
+                f"Hem Spot (%{spot_cvd_ratio*100:.0f}) hem Futures (%{cvd_ratio*100:.0f}) CVD guclu "
+                f"-- gercek/kurumsal alim olabilir, daha saglikli bir yukselis."
+            )
+
+    # YENI (Madde 4): "Taze + RSI<60 + CVD>65" -> ozel vurgu (Guclu Setup).
+    if (
+        freshness_label == "TAZE"
+        and short_rsi is not None and short_rsi < STRONG_SETUP_RSI_MAX
+        and cvd_ratio is not None and cvd_ratio > STRONG_SETUP_CVD_MIN
+    ):
+        notlar.append(
+            "🔥 GUCLU SETUP: Taze + RSI<60 + CVD>65 -- agresif akumulasyon, "
+            "saglikli bir yukselis baslangici olabilir."
+        )
+
     if not notlar:
         notlar.append("Ek teyit sinyalleri (OI/CVD) notr veya yetersiz veri -- sadece "
                        "hacim/fiyat verisine dayanan bir sinyal.")
@@ -1467,12 +1450,9 @@ def run_scanner():
         logging.warning("Bybit'ten ticker verisi alınamadı.")
         return
 
-    # Bybit'te OI ayri istek gerektirmiyor, ticker cevabinin icinden cikariyoruz.
     oi_map = get_all_open_interest(tickers)
     logging.info(f"[OI] {len(oi_map)} enstruman icin Open Interest verisi alindi.")
 
-    # CoinGecko Trending listesini TEK istekte cek (cache'li, her tarama
-    # turunda yeniden istek atmiyor -- 10 dakikada bir yenileniyor).
     try:
         trending_symbols = get_coingecko_trending()
         logging.info(f"[CoinGecko] Trending listesi: {len(trending_symbols)} sembol.")
@@ -1503,15 +1483,11 @@ def run_scanner():
             if turnover_24h < MIN_TURNOVER_24H:
                 continue
 
-            # --- YENI FORMUL: hacim orani (kendi gecmisine gore) ana belirleyici ---
             avg_turnover = get_average_turnover(inst_id)
             if avg_turnover is not None and avg_turnover > 0:
                 volume_ratio = turnover_24h / avg_turnover
                 power_score = volume_ratio * (1 + abs(change_24h_pct) / 100.0)
             else:
-                # Yeterli gecmis yok -- guvenilir bir oran hesaplanamaz.
-                # Bu coin icin ALARM VERILMEZ, ama gozlem yine de kaydedilir
-                # (gelecekteki taramalar icin baseline birikmeye devam etsin diye).
                 volume_ratio = None
                 power_score = None
 
@@ -1527,6 +1503,14 @@ def run_scanner():
                 prev_oi = get_previous_oi(inst_id)
                 if prev_oi and prev_oi > 0:
                     oi_change_pct = (current_oi - prev_oi) / prev_oi * 100.0
+
+            # YENI (Madde 3, 6): funding rate ticker cevabinin ICINDE zaten
+            # geliyor -- ekstra istek gerekmiyor.
+            try:
+                funding_rate = float(t.get("fundingRate")) if t.get("fundingRate") not in (None, "") else None
+            except (TypeError, ValueError):
+                funding_rate = None
+            funding_pct = funding_rate * 100 if funding_rate is not None else None
 
             position_in_range = None
             if high_24h > low_24h:
@@ -1548,18 +1532,25 @@ def run_scanner():
                 "position_in_range": position_in_range,
                 "yorum": None,
                 "volume_ratio": volume_ratio,
+                "funding_rate": funding_rate,
             }
 
             all_results.append(obs_data)
 
-            # --- YENI: Kirilim sinyali (ana hype sistemine PARALEL, bagimsiz) ---
-            # YENI MANTIK: iki yoldan biri yeterli --
-            # (a) kendi DB'mizdeki hacim orani esigi gecerse (eskisi gibi), YA DA
-            # (b) Bybit'in DOGRUDAN verdigi 24s fiyat degisimi esigi gecerse
-            #     (DB'ye HIC bagimli degil -- coin'in baseline'i henuz olgun
-            #     olmasa bile, gercekten hareket eden coin kacirilmasin diye).
-            # Bu, kirilim sisteminin GERCEKTEN kendi veritabanimizdan bagimsiz
-            # calisma amacini yerine getiriyor.
+            # YENI (Madde 6): Funding asiriligi bazli, ana hype sisteminden
+            # BAGIMSIZ, paralel bir tarama. Ekstra API cagrisi gerektirmiyor
+            # (funding_rate zaten ticker'dan geldi).
+            try:
+                if funding_pct is not None and not is_recently_notified_funding(inst_id):
+                    is_funding_extreme = (
+                        funding_pct >= FUNDING_SCAN_EXTREME_PCT or funding_pct <= -FUNDING_SCAN_EXTREME_PCT
+                    )
+                    price_moved_enough = abs(change_24h_pct) >= FUNDING_SCAN_MIN_PRICE_MOVE_PCT
+                    if is_funding_extreme and price_moved_enough:
+                        send_funding_alert(inst_id, funding_pct, change_24h_pct)
+            except Exception as e:
+                logging.error(f"{inst_id} funding taramasi hatasi: {e}")
+
             try:
                 volume_prefilter_passed = (
                     volume_ratio is not None and volume_ratio >= BREAKOUT_PREFILTER_VOLUME_RATIO
@@ -1584,22 +1575,15 @@ def run_scanner():
             )
             big_move_path_passed = abs(change_24h_pct) >= BIG_MOVE_PRICE_CHANGE_PCT
 
-            should_notify = (
+            should_notify_preliminary = (
                 (score_path_passed or big_move_path_passed)
                 and not is_recently_notified(inst_id)
             )
 
-            if should_notify:
+            if should_notify_preliminary:
                 cvd_ratio = get_cvd_buy_ratio(inst_id)
                 obs_data["cvd_buy_ratio"] = cvd_ratio
 
-                yorum = generate_commentary(
-                    change_24h_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio
-                )
-
-                # YENI: kisa vadeli (15dk) veriyle TAZE/UZAMIS tespiti.
-                # Kendi veritabanimiza ihtiyac duymaz, Bybit'in kendi
-                # kisa vadeli mumlarindan anlik hesaplanir.
                 try:
                     freshness_info = classify_freshness(inst_id)
                 except Exception as e:
@@ -1607,31 +1591,61 @@ def run_scanner():
                     freshness_info = {"label": "BELIRSIZ", "short_rsi": None,
                                        "breakout_age_minutes": None, "aciklama": "Hesaplanamadi."}
 
-                # CoinGecko Trending ile capraz teyit -- bu coin hem bizim
-                # hacim taramamizda HEM CoinGecko'nun kendi arama trendinde
-                # cikiyorsa, bu guclu bir capraz dogrulamadir.
-                base_symbol = inst_id.replace("USDT", "").strip().upper()
-                is_trending = base_symbol in trending_symbols
-                if is_trending:
-                    yorum += (" 🔥 Ayrica CoinGecko'nun Trending (en cok aranan) listesinde de var -- "
-                              "hem hacim hem genel arama ilgisi ayni anda yukseliyor, capraz teyit guclu.")
+                # YENI (Madde 1): RSI asiri + eski hareket + CVD uyumsuzlugu
+                # varsa -- bu "cikis/tersine donus" bolgesi, TAMAMEN BASTIR.
+                suppress_exhausted = is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
 
-                obs_data["yorum"] = yorum
-                obs_data["notified"] = 1
+                # YENI (Madde 2): OI verisi yoksa (hesaplanamiyorsa) bastir.
+                suppress_no_oi = oi_change_pct is None
 
-                alerts_to_send.append({
-                    "inst_id": inst_id,
-                    "price": last_price,
-                    "change": change_24h_pct,
-                    "turnover": turnover_24h,
-                    "freshness_info": freshness_info,
-                    "score": final_score,
-                    "volume_ratio": volume_ratio,
-                    "freshness": freshness_ratio,
-                    "oi_change_pct": oi_change_pct,
-                    "cvd_ratio": cvd_ratio,
-                    "yorum": yorum,
-                })
+                if suppress_exhausted:
+                    logging.info(f"[Bastirma] {inst_id}: tukenme/ters donus bolgesinde, sinyal bastirildi.")
+                elif suppress_no_oi:
+                    logging.info(f"[Bastirma] {inst_id}: OI verisi yok, sinyal bastirildi.")
+                else:
+                    # YENI (Madde 3): funding degisimi (son ~6 saat).
+                    prev_funding = get_previous_funding_rate(inst_id)
+                    funding_change_pct = None
+                    if prev_funding is not None and funding_pct is not None:
+                        funding_change_pct = funding_pct - (prev_funding * 100)
+
+                    # YENI (Madde 5): Spot CVD -- sadece gonderilecek adaylar
+                    # icin cekiliyor (gereksiz API yukunu onlemek adina).
+                    try:
+                        spot_cvd_ratio = get_spot_cvd_buy_ratio(inst_id)
+                    except Exception as e:
+                        logging.error(f"{inst_id} Spot CVD tespiti hatasi: {e}")
+                        spot_cvd_ratio = None
+
+                    yorum = generate_commentary(
+                        change_24h_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio,
+                        funding_pct=funding_pct, funding_change_pct=funding_change_pct,
+                        spot_cvd_ratio=spot_cvd_ratio, freshness_label=freshness_info.get("label"),
+                        short_rsi=freshness_info.get("short_rsi"),
+                    )
+
+                    base_symbol = inst_id.replace("USDT", "").strip().upper()
+                    is_trending = base_symbol in trending_symbols
+                    if is_trending:
+                        yorum += (" 🔥 Ayrica CoinGecko'nun Trending (en cok aranan) listesinde de var -- "
+                                  "hem hacim hem genel arama ilgisi ayni anda yukseliyor, capraz teyit guclu.")
+
+                    obs_data["yorum"] = yorum
+                    obs_data["notified"] = 1
+
+                    alerts_to_send.append({
+                        "inst_id": inst_id,
+                        "price": last_price,
+                        "change": change_24h_pct,
+                        "turnover": turnover_24h,
+                        "freshness_info": freshness_info,
+                        "score": final_score,
+                        "volume_ratio": volume_ratio,
+                        "freshness": freshness_ratio,
+                        "oi_change_pct": oi_change_pct,
+                        "cvd_ratio": cvd_ratio,
+                        "yorum": yorum,
+                    })
 
             record_observation(obs_data)
 
@@ -1644,7 +1658,6 @@ def run_scanner():
             direction = "🟢" if a["change"] >= 0 else "🔴"
             msg += f"{direction} *{a['inst_id']}*\n"
 
-            # YENI: TAZE/UZAMIS etiketi -- en one, en dikkat cekici yere konuyor
             fi = a.get("freshness_info", {})
             label = fi.get("label", "BELIRSIZ")
             if label == "TAZE":
@@ -1672,8 +1685,6 @@ def run_scanner():
 
         send_telegram_alert(msg)
 
-    # None olan final_score'lari (yeterli gecmisi olmayan coinler) siralamada
-    # en sona at, hata vermesinler.
     top_candidates = sorted(
         all_results, key=lambda x: x["final_score"] if x["final_score"] is not None else -1, reverse=True
     )[:5]
@@ -1691,23 +1702,7 @@ def run_scanner():
     logging.info("✅ Tarama tamamlandı.")
 
 
-# ---------------------------------------------------------------------------
-# 4 SAATLIK OZET RAPORU
-# ---------------------------------------------------------------------------
-# Bu bolum run_scanner()'a HICBIR sekilde dokunmaz -- sadece zaten biriken
-# veriyi (her taramada TUM taranan coinler icin kaydedilen fiyat/notified
-# bilgisi) okuyup periyodik bir ozet Telegram mesaji uretir.
-
 def generate_4h_report():
-    """
-    Son ~4 saatte biriken gozlemlerden, her coin icin O PENCEREDEKI ilk ve
-    son fiyati kiyaslayarak GERCEK 4 saatlik fiyat degisimini hesaplar
-    (Bybit'in kendi '24s degisim' alanindan FARKLI bir hesap -- bu bizim
-    kendi biriktirdigimiz veriden, tam 4 saatlik pencere icin).
-    Ayrica o coin icin bu pencerede alarm verilip verilmedigini (notified)
-    kontrol eder.
-    Donus: buyukten kucuge siralanmis mover listesi.
-    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     since_ts = (datetime.now(timezone.utc) - timedelta(hours=4, minutes=15)).isoformat()
@@ -1744,7 +1739,6 @@ def generate_4h_report():
 
 
 def send_4h_report():
-    """4 saatlik ozet raporunu Telegram'a gonderir."""
     movers = generate_4h_report()
     total = len(movers)
     caught = sum(1 for m in movers if m["caught"])
@@ -1768,7 +1762,7 @@ def send_4h_report():
 
 def main_loop():
     init_db()
-    last_report_ts = time.time()  # ilk rapor, deploy'dan 4 saat sonra gonderilir
+    last_report_ts = time.time()
     while True:
         try:
             run_scanner()
