@@ -1218,13 +1218,21 @@ def send_breakout_alert(inst_id: str, breakout_info: dict, hold_confirmed):
     else:
         hold_text = "ℹ️ 5dk teyit verisi yetersiz"
 
+try:
+        cross = get_recent_cross_signals(inst_id, exclude_type="breakout")
+        cross_note = format_cross_signal_note(cross, current_type="breakout")
+    except Exception as e:
+        logging.error(f"{inst_id} capraz sinyal kontrolu hatasi: {e}")
+        cross_note = ""
+
     msg = (
         f"{emoji} *{yon_text}* -- {inst_id}\n\n"
         f"Konsolidasyon araligi: {breakout_info['range_low']:.6g} - {breakout_info['range_high']:.6g}\n"
         f"Kirilim kapanisi: {breakout_info['breakout_close']:.6g}\n"
         f"Kirilim hacmi: pencere ortalamasinin {breakout_info['volume_ratio']:.1f} kati\n"
-        f"{hold_text}\n\n"
-        f"_Bu ayri bir tespit turudur -- ana hacim/skor sistemi ile bagimsiz calisir. "
+        f"{hold_text}\n"
+        + (f"\n{cross_note}\n" if cross_note else "")
+        + f"\n_Bu ayri bir tespit turudur -- ana hacim/skor sistemi ile bagimsiz calisir. "
         f"Yatirim tavsiyesi degildir._"
     )
     send_telegram_alert(msg)
@@ -1256,6 +1264,85 @@ def is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio):
         return cvd_ratio <= CVD_SELL_STRONG
     else:
         return cvd_ratio >= CVD_BUY_STRONG
+
+CROSS_SIGNAL_LOOKBACK_HOURS = 6.0  # bu pencerede diger sinyal turleri kontrol edilir
+
+
+def get_recent_cross_signals(inst_id: str, exclude_type: str, hours: float = CROSS_SIGNAL_LOOKBACK_HOURS):
+    """
+    YENI: Bir coin icin SON birkac saat icinde DIGER sinyal turlerinden
+    (kirilim, funding, giris firsati) herhangi biri tetiklenmis mi kontrol
+    eder -- boylece farkli turler ayni coin icin farkli zamanlarda gelse
+    bile birbirine 'baglanir', hicbiri fark edilmeden kaybolmaz.
+
+    exclude_type: 'breakout' / 'funding' / 'entry' -- kendi turunu haric tutar.
+    Donus: [{'type':'funding','timestamp':...}, ...] (en yeniden en eskiye).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    results = []
+
+    if exclude_type != "breakout":
+        rows = conn.execute(
+            "SELECT timestamp FROM breakout_alerts WHERE inst_id=? AND timestamp>=? ORDER BY timestamp DESC",
+            (inst_id, cutoff),
+        ).fetchall()
+        for (ts,) in rows:
+            results.append({"type": "breakout", "timestamp": ts})
+
+    if exclude_type != "funding":
+        rows = conn.execute(
+            "SELECT timestamp FROM funding_alerts WHERE inst_id=? AND timestamp>=? ORDER BY timestamp DESC",
+            (inst_id, cutoff),
+        ).fetchall()
+        for (ts,) in rows:
+            results.append({"type": "funding", "timestamp": ts})
+
+    if exclude_type != "entry":
+        rows = conn.execute(
+            "SELECT timestamp FROM hype_observations WHERE inst_id=? AND notified=1 AND timestamp>=? ORDER BY timestamp DESC",
+            (inst_id, cutoff),
+        ).fetchall()
+        for (ts,) in rows:
+            results.append({"type": "entry", "timestamp": ts})
+
+    conn.close()
+    results.sort(key=lambda x: x["timestamp"], reverse=True)
+    return results
+
+
+def format_cross_signal_note(cross_signals, current_type: str):
+    """
+    YENI: Capraz sinyal listesini okunabilir Turkce nota cevirir. Eger
+    3 turun UCU DE (kirilim+funding+giris firsati) ayni pencerede
+    tetiklenmisse, ozel bir vurgu ekler.
+    """
+    if not cross_signals:
+        return ""
+
+    type_names = {"breakout": "KIRILIM", "funding": "FUNDING ASIRILIGI", "entry": "GIRIS FIRSATI"}
+    now = datetime.now(timezone.utc)
+
+    lines = []
+    seen_types = {current_type}
+    for s in cross_signals[:3]:
+        seen_types.add(s["type"])
+        try:
+            ts = datetime.fromisoformat(s["timestamp"])
+            hours_ago = (now - ts).total_seconds() / 3600.0
+            zaman_str = f"~{hours_ago:.1f} saat once"
+        except Exception:
+            zaman_str = "yakin zamanda"
+        lines.append(f"{type_names.get(s['type'], s['type'])} ({zaman_str})")
+
+    if len(seen_types) >= 3:
+        prefix = "🔥 *UCU DE TETIKLENDI* -- "
+    else:
+        prefix = "🔗 "
+
+    if len(lines) == 1:
+        return f"{prefix}Bu coin icin ayrica {lines[0]} sinyali de vardi."
+    return f"{prefix}Bu coin icin ayrica: " + ", ".join(lines) + " sinyalleri de vardi."
 
 
 def is_recently_notified_funding(inst_id: str) -> bool:
@@ -1305,10 +1392,18 @@ def send_funding_alert(inst_id: str, funding_pct: float, change_24h_pct: float):
     else:
         return  # kombinasyon net degil, gonderme
 
+try:
+        cross = get_recent_cross_signals(inst_id, exclude_type="funding")
+        cross_note = format_cross_signal_note(cross, current_type="funding")
+    except Exception as e:
+        logging.error(f"{inst_id} capraz sinyal kontrolu hatasi: {e}")
+        cross_note = ""
+
     msg = (
         f"{emoji} *FUNDING ASIRILIGI* -- {inst_id}\n\n"
-        f"{aciklama}\n\n"
-        f"_Bu, ana hype sisteminden bagimsiz, sadece funding/fiyat kombinasyonuna "
+        f"{aciklama}\n"
+        + (f"\n{cross_note}\n" if cross_note else "")
+        + f"\n_Bu, ana hype sisteminden bagimsiz, sadece funding/fiyat kombinasyonuna "
         f"dayanan ayri bir tarama. Yatirim tavsiyesi degildir._"
     )
     send_telegram_alert(msg)
@@ -1841,7 +1936,18 @@ def run_scanner():
 
             score_str = f"{a['score']:.1f}" if a["score"] is not None else "n/a (BUYUK HAREKET yolu ile geldi)"
             msg += f"• *Final Skor:* `{score_str}`\n"
-            msg += f"📝 _{a['yorum']}_\n\n"
+            msg += f"📝 _{a['yorum']}_\n"
+
+            try:
+                cross = get_recent_cross_signals(a["inst_id"], exclude_type="entry")
+                cross_note = format_cross_signal_note(cross, current_type="entry")
+                if cross_note:
+                    msg += f"{cross_note}\n"
+            except Exception as e:
+                logging.error(f"{a['inst_id']} capraz sinyal kontrolu hatasi: {e}")
+
+            msg += "\n"
+            
 
         send_telegram_alert(msg)
 
