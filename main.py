@@ -1455,9 +1455,7 @@ def run_scanner():
                     freshness_info = {"label": "BELIRSIZ", "short_rsi": None,
                                        "breakout_age_minutes": None, "aciklama": "Hesaplanamadi."}
 
-                # =========================================================================
-                # DÜZELTME 1: "BELİRSİZ" DURUMDAKİ SİNYALLERİ TAMAMEN BASTIR / ENGELLE
-                # =========================================================================
+                # 1. "BELİRSİZ" DURUMDAKİ SİNYALLERİ BASTIR / ENGELLE
                 if freshness_info.get("label") == "BELIRSIZ":
                     logging.info(f"[Bastirma] {inst_id}: Tazelik durumu BELIRSIZ oldugu icin sinyal engellendi.")
                     record_observation(obs_data)
@@ -1469,10 +1467,20 @@ def run_scanner():
                 suppress_exhausted = is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
                 suppress_no_oi = oi_change_pct is None
 
+                # 2. RSI & CVD STRICT GATEKEEPER FILTERS (RSI < 60 ve CVD > 65%)
+                short_rsi = freshness_info.get("short_rsi")
+                suppress_rsi = short_rsi is None or short_rsi >= STRONG_SETUP_RSI_MAX
+                suppress_cvd = cvd_ratio is None or cvd_ratio <= STRONG_SETUP_CVD_MIN
+
                 if suppress_exhausted:
                     logging.info(f"[Bastirma] {inst_id}: tukenme/ters donus bolgesinde, sinyal bastirildi.")
                 elif suppress_no_oi:
                     logging.info(f"[Bastirma] {inst_id}: OI verisi yok, sinyal bastirildi.")
+                elif suppress_rsi:
+                    logging.info(f"[Bastirma] {inst_id}: RSI yüksek (RSI: {short_rsi}) -- Sinyal iptal.")
+                elif suppress_cvd:
+                    cvd_val_str = f"%{cvd_ratio*100:.1f}" if cvd_ratio is not None else "Yok"
+                    logging.info(f"[Bastirma] {inst_id}: CVD yetersiz ({cvd_val_str} <= %65) -- Sinyal iptal.")
                 else:
                     prev_funding = get_previous_funding_rate(inst_id)
                     funding_change_pct = None
@@ -1521,7 +1529,7 @@ def run_scanner():
             logging.error(f"Hata ({t.get('symbol')}): {e}")
 
     # =========================================================================
-    # DÜZELTME 2: TÜM VERİLERİ İÇEREN TEK TELEGRAM MESAJ KARTI
+    # TÜM VERİLERİ İÇEREN TEK TELEGRAM MESAJ KARTI
     # =========================================================================
     if alerts_to_send:
         msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
