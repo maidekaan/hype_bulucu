@@ -627,25 +627,12 @@ CVD_BUY_STRONG = 0.60
 CVD_SELL_STRONG = 0.45
 EXHAUSTION_POSITION_THRESHOLD = 0.90
 
-# --- YENI (Madde 1): Tukenme/ters donus bolgesinde ana sinyali TAMAMEN BASTIR ---
-# RSI asiri + hareket eski + CVD uyumsuzlugu ayni anda varsa, bu "giris" degil
-# "cikis/tersine donus" bolgesidir -- Burakcan'in notuna gore boyle bir durumda
-# "HYPE" diye bildirim gondermek yaniltici, o yuzden TAMAMEN BASTIRILIYOR
-# (hem skor yolu hem buyuk hareket yolu icin).
-
-# --- YENI (Madde 3): Funding rate esikleri (ana taramada da kullanilacak) ---
-FUNDING_EXTREME_POS_PCT = 0.05   # /analiz sayfasindaki esikle tutarli
+FUNDING_EXTREME_POS_PCT = 0.05   
 FUNDING_EXTREME_NEG_PCT = -0.05
-FUNDING_HISTORY_LOOKBACK_HOURS = 6.0  # "son 4-8 saatteki degisim" icin kullanilan pencere
+FUNDING_HISTORY_LOOKBACK_HOURS = 6.0  
 
-# --- YENI (Madde 4): "Guclu Setup" vurgusu icin esikler ---
 STRONG_SETUP_RSI_MAX = 60.0
 STRONG_SETUP_CVD_MIN = 0.65
-
-# --- YENI (Madde 6): Funding asiriligi bazli AYRI, paralel bir tarama ---
-FUNDING_SCAN_EXTREME_PCT = 0.05          # bu yuzdenin uzerindeki/altindaki funding 'asiri' sayilir
-FUNDING_SCAN_MIN_PRICE_MOVE_PCT = 10.0    # fiyat da bu kadar hareket etmis olmali
-FUNDING_SCAN_COOLDOWN_HOURS = 6.0         # ayri bir cooldown -- diger sinyallerden bagimsiz
 
 logging.basicConfig(
     level=logging.INFO,
@@ -689,19 +676,6 @@ def init_db():
     """)
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_breakout_inst_time ON breakout_alerts (inst_id, timestamp)"
-    )
-
-    # YENI (Madde 6): Funding asiriligi sinyali icin AYRI bir tablo --
-    # kirilim tablosuyla ayni desen, sifir risk.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS funding_alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            inst_id TEXT NOT NULL
-        )
-    """)
-    cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_funding_inst_time ON funding_alerts (inst_id, timestamp)"
     )
 
     for col_def in [
@@ -793,11 +767,6 @@ def get_previous_oi(inst_id: str):
 
 
 def get_previous_funding_rate(inst_id: str, hours_ago: float = FUNDING_HISTORY_LOOKBACK_HOURS):
-    """
-    YENI (Madde 3): Yaklasik 'hours_ago' saat once kaydedilmis funding rate
-    degerini bulur -- "son 4-8 saatteki degisim" hesaplamak icin. Kendi
-    veritabanimizdan, ayni get_previous_oi mantigiyla.
-    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_ago + 0.5)).isoformat()
@@ -1151,18 +1120,6 @@ def send_breakout_alert(inst_id: str, breakout_info: dict, hold_confirmed):
 
 
 def is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio):
-    """
-    YENI (Madde 1): RSI asiri + hareket ESKI + CVD uyumsuzlugu AYNI ANDA
-    varsa, bu artik "giris" degil "cikis/ters donus" bolgesi sayilir.
-    Kararlastirildigi gibi boyle bir durumda ana HYPE sinyali TAMAMEN
-    BASTIRILIR (hem skor yolu hem buyuk hareket yolu icin) -- ayri bir
-    SHORT sinyali degil, sadece sessizce atlanir (zaten kirilim sistemi
-    ayri calisiyor).
-
-    CVD uyumsuzlugu: fiyat yukselirken CVD zayifsa (satis baskisi var),
-    ya da fiyat duserken CVD guclu alis gosteriyorsa (satis tukenmis
-    olabilir) -- ikisi de "yon ile hacim arasinda catisma var" demek.
-    """
     if freshness_info is None:
         return False
     if freshness_info.get("label") != "UZAMIS":
@@ -1174,64 +1131,6 @@ def is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio):
         return cvd_ratio <= CVD_SELL_STRONG
     else:
         return cvd_ratio >= CVD_BUY_STRONG
-
-
-def is_recently_notified_funding(inst_id: str) -> bool:
-    """YENI (Madde 6): Funding asiriligi sinyali icin AYRI bir cooldown."""
-    conn = sqlite3.connect(DB_PATH)
-    cutoff_time = (
-        datetime.now(timezone.utc) - timedelta(hours=FUNDING_SCAN_COOLDOWN_HOURS)
-    ).isoformat()
-    row = conn.execute(
-        "SELECT COUNT(*) FROM funding_alerts WHERE inst_id = ? AND timestamp >= ?",
-        (inst_id, cutoff_time),
-    ).fetchone()
-    conn.close()
-    return row[0] > 0
-
-
-def record_funding_alert(inst_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO funding_alerts (timestamp, inst_id) VALUES (?, ?)",
-        (datetime.now(timezone.utc).isoformat(), inst_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def send_funding_alert(inst_id: str, funding_pct: float, change_24h_pct: float):
-    """
-    YENI (Madde 6): Funding asiriligi bazli, ana hype sisteminden TAMAMEN
-    BAGIMSIZ, paralel bir tarama. "Funding cok yuksek/dusuk VE fiyat zaten
-    hareket etmis" durumunu yakalar -- coin hic hype sinyali vermese bile.
-    """
-    if funding_pct >= FUNDING_SCAN_EXTREME_PCT and change_24h_pct > 0:
-        emoji = "⚠️"
-        aciklama = (
-            f"Funding %{funding_pct:.3f} (asiri pozitif) + fiyat zaten %{change_24h_pct:.1f} "
-            f"yukselmis -- long tarafi kalabalik, ani bir long tasfiyesi (fiyat dususu) "
-            f"riski artmis olabilir."
-        )
-    elif funding_pct <= FUNDING_SCAN_EXTREME_PCT * -1 and change_24h_pct < 0:
-        emoji = "⚠️"
-        aciklama = (
-            f"Funding %{funding_pct:.3f} (asiri negatif) + fiyat zaten %{change_24h_pct:.1f} "
-            f"dusmus -- short tarafi kalabalik, ani bir short squeeze (fiyat sicramasi) "
-            f"riski artmis olabilir."
-        )
-    else:
-        return  # kombinasyon net degil, gonderme
-
-    msg = (
-        f"{emoji} *FUNDING ASIRILIGI* -- {inst_id}\n\n"
-        f"{aciklama}\n\n"
-        f"_Bu, ana hype sisteminden bagimsiz, sadece funding/fiyat kombinasyonuna "
-        f"dayanan ayri bir tarama. Yatirim tavsiyesi degildir._"
-    )
-    send_telegram_alert(msg)
-    record_funding_alert(inst_id)
-    logging.info(f"[Funding] {inst_id} icin funding asiriligi sinyali gonderildi.")
 
 
 def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
@@ -1258,17 +1157,6 @@ def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
 
 
 def get_spot_cvd_buy_ratio(inst_id: str, limit: int = 300):
-    """
-    YENI (Madde 5): Ayni hesaplamayi SPOT piyasa icin yapar (category='spot').
-    Futures CVD ile kiyaslanip "bu yukselis gercek/spot alicilardan mi,
-    yoksa sadece kaldiracli/futures kumarindan mi geliyor" ayrimini yapmak
-    icin kullanilir.
-
-    ONEMLI: Bybit'te her futures sembolunun bir spot karsiligi OLMAYABILIR
-    (bircok kucuk/yeni coin sadece vadeli islemde listelenir). Bu durumda
-    Bybit hata donuyor, biz de None donup sessizce atliyoruz -- hata
-    firlatmiyoruz, sistemi cokertmiyor.
-    """
     url = f"{BYBIT_BASE_URL}/v5/market/recent-trade"
     try:
         response = requests.get(
@@ -1276,7 +1164,7 @@ def get_spot_cvd_buy_ratio(inst_id: str, limit: int = 300):
         )
         data = response.json()
         if data.get("retCode") != 0:
-            return None  # bu sembol icin spot piyasa yok olabilir, normal
+            return None
         trades = data.get("result", {}).get("list", [])
         if not trades:
             return None
@@ -1384,21 +1272,19 @@ def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range,
                 f"dusus baskisi guclu gorunuyor."
             )
 
-    # YENI (Madde 3): Funding rate + OI + fiyat kombinasyonu.
-    # Kural: Fiyat yukselirken + OI artarken + Funding NEGATIF -> mukemmel long
-    # (short squeeze potansiyeli). Fiyat yukselirken + OI artarken + Funding
-    # ASIRI POZITIF -> riskli (tepede long birikmis, patlayabilir).
-    if funding_pct is not None and oi_change_pct is not None:
-        oi_artiyor = oi_change_pct >= OI_CHANGE_STRONG_PCT
-        if yon_yukari and oi_artiyor and funding_pct <= FUNDING_EXTREME_NEG_PCT:
+    # Funding rate genel durum & aşırılık analizi (Tek sinyal içinde)
+    if funding_pct is not None:
+        if funding_pct >= FUNDING_EXTREME_POS_PCT:
             notlar.append(
-                f"Funding NEGATIF (%{funding_pct:.3f}) + OI artisi + fiyat yukselisi -- "
-                f"MUKEMMEL LONG kurulumu olabilir, short squeeze potansiyeli var."
+                f"🚨 Funding Orani ASIRI POZITIF (%{funding_pct:.3f}) -- Long tarafı aşırı kalabalık, ani tasfiye/geri çekilme riski yüksek."
             )
-        elif yon_yukari and oi_artiyor and funding_pct >= FUNDING_EXTREME_POS_PCT:
+        elif funding_pct <= FUNDING_EXTREME_NEG_PCT:
             notlar.append(
-                f"Funding ASIRI POZITIF (%{funding_pct:.3f}) -- tepede long birikmis, "
-                f"ani bir dususe (long tasfiyesi) karsi riskli olabilir."
+                f"🚨 Funding Orani ASIRI NEGATIF (%{funding_pct:.3f}) -- Short tarafı aşırı kalabalık, ani Short Squeeze (sıçrama) potansiyeli yüksek."
+            )
+        elif oi_change_pct is not None and oi_change_pct >= OI_CHANGE_STRONG_PCT and yon_yukari and funding_pct < 0:
+            notlar.append(
+                f"Funding NEGATIF (%{funding_pct:.3f}) + OI artisi + fiyat yukselisi -- MUKEMMEL LONG kurulumu potansiyeli."
             )
 
     if funding_change_pct is not None and abs(funding_change_pct) >= 0.02:
@@ -1407,34 +1293,29 @@ def generate_commentary(change_pct, oi_change_pct, cvd_ratio, position_in_range,
             f"Funding rate son ~{FUNDING_HISTORY_LOOKBACK_HOURS:.0f} saatte %{abs(funding_change_pct):.3f} {yon_text}."
         )
 
-    # YENI (Madde 5): Spot CVD vs Futures CVD ayrimi.
     if spot_cvd_ratio is not None and cvd_ratio is not None and yon_yukari:
         if cvd_ratio >= CVD_BUY_STRONG and spot_cvd_ratio < 0.50:
             notlar.append(
                 f"Futures CVD guclu (%{cvd_ratio*100:.0f}) ama Spot CVD zayif (%{spot_cvd_ratio*100:.0f}) "
-                f"-- yukselis agirlikli olarak kaldiracli (futures) pozisyonlardan geliyor, "
-                f"omru kisa olabilir."
+                f"-- yukselis agirlikli olarak kaldiracli pozisyonlardan geliyor."
             )
         elif cvd_ratio >= 0.55 and spot_cvd_ratio >= 0.55:
             notlar.append(
                 f"Hem Spot (%{spot_cvd_ratio*100:.0f}) hem Futures (%{cvd_ratio*100:.0f}) CVD guclu "
-                f"-- gercek/kurumsal alim olabilir, daha saglikli bir yukselis."
+                f"-- gercek/spot destekli saglikli bir yukselis."
             )
 
-    # YENI (Madde 4): "Taze + RSI<60 + CVD>65" -> ozel vurgu (Guclu Setup).
     if (
         freshness_label == "TAZE"
         and short_rsi is not None and short_rsi < STRONG_SETUP_RSI_MAX
         and cvd_ratio is not None and cvd_ratio > STRONG_SETUP_CVD_MIN
     ):
         notlar.append(
-            "🔥 GUCLU SETUP: Taze + RSI<60 + CVD>65 -- agresif akumulasyon, "
-            "saglikli bir yukselis baslangici olabilir."
+            "🔥 GUCLU SETUP: Taze + RSI<60 + CVD>65 -- agresif akumulasyon, saglikli yukselis baslangici."
         )
 
     if not notlar:
-        notlar.append("Ek teyit sinyalleri (OI/CVD) notr veya yetersiz veri -- sadece "
-                       "hacim/fiyat verisine dayanan bir sinyal.")
+        notlar.append("Ek teyit sinyalleri (OI/CVD) notr veya yetersiz veri -- sadece hacim/fiyat verisine dayanan bir sinyal.")
 
     return " ".join(notlar)
 
@@ -1504,8 +1385,6 @@ def run_scanner():
                 if prev_oi and prev_oi > 0:
                     oi_change_pct = (current_oi - prev_oi) / prev_oi * 100.0
 
-            # YENI (Madde 3, 6): funding rate ticker cevabinin ICINDE zaten
-            # geliyor -- ekstra istek gerekmiyor.
             try:
                 funding_rate = float(t.get("fundingRate")) if t.get("fundingRate") not in (None, "") else None
             except (TypeError, ValueError):
@@ -1537,20 +1416,7 @@ def run_scanner():
 
             all_results.append(obs_data)
 
-            # YENI (Madde 6): Funding asiriligi bazli, ana hype sisteminden
-            # BAGIMSIZ, paralel bir tarama. Ekstra API cagrisi gerektirmiyor
-            # (funding_rate zaten ticker'dan geldi).
-            try:
-                if funding_pct is not None and not is_recently_notified_funding(inst_id):
-                    is_funding_extreme = (
-                        funding_pct >= FUNDING_SCAN_EXTREME_PCT or funding_pct <= -FUNDING_SCAN_EXTREME_PCT
-                    )
-                    price_moved_enough = abs(change_24h_pct) >= FUNDING_SCAN_MIN_PRICE_MOVE_PCT
-                    if is_funding_extreme and price_moved_enough:
-                        send_funding_alert(inst_id, funding_pct, change_24h_pct)
-            except Exception as e:
-                logging.error(f"{inst_id} funding taramasi hatasi: {e}")
-
+            # Kırılım (Breakout) Tespiti Kontrolü
             try:
                 volume_prefilter_passed = (
                     volume_ratio is not None and volume_ratio >= BREAKOUT_PREFILTER_VOLUME_RATIO
@@ -1570,6 +1436,7 @@ def run_scanner():
             except Exception as e:
                 logging.error(f"{inst_id} kirilim tespiti hatasi: {e}")
 
+            # Ana Sinyal Filtresi
             score_path_passed = (
                 final_score is not None and final_score >= ALERT_POWER_SCORE_THRESHOLD
             )
@@ -1581,9 +1448,6 @@ def run_scanner():
             )
 
             if should_notify_preliminary:
-                cvd_ratio = get_cvd_buy_ratio(inst_id)
-                obs_data["cvd_buy_ratio"] = cvd_ratio
-
                 try:
                     freshness_info = classify_freshness(inst_id)
                 except Exception as e:
@@ -1591,11 +1455,18 @@ def run_scanner():
                     freshness_info = {"label": "BELIRSIZ", "short_rsi": None,
                                        "breakout_age_minutes": None, "aciklama": "Hesaplanamadi."}
 
-                # YENI (Madde 1): RSI asiri + eski hareket + CVD uyumsuzlugu
-                # varsa -- bu "cikis/tersine donus" bolgesi, TAMAMEN BASTIR.
-                suppress_exhausted = is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
+                # =========================================================================
+                # DÜZELTME 1: "BELİRSİZ" DURUMDAKİ SİNYALLERİ TAMAMEN BASTIR / ENGELLE
+                # =========================================================================
+                if freshness_info.get("label") == "BELIRSIZ":
+                    logging.info(f"[Bastirma] {inst_id}: Tazelik durumu BELIRSIZ oldugu icin sinyal engellendi.")
+                    record_observation(obs_data)
+                    continue
 
-                # YENI (Madde 2): OI verisi yoksa (hesaplanamiyorsa) bastir.
+                cvd_ratio = get_cvd_buy_ratio(inst_id)
+                obs_data["cvd_buy_ratio"] = cvd_ratio
+
+                suppress_exhausted = is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
                 suppress_no_oi = oi_change_pct is None
 
                 if suppress_exhausted:
@@ -1603,14 +1474,11 @@ def run_scanner():
                 elif suppress_no_oi:
                     logging.info(f"[Bastirma] {inst_id}: OI verisi yok, sinyal bastirildi.")
                 else:
-                    # YENI (Madde 3): funding degisimi (son ~6 saat).
                     prev_funding = get_previous_funding_rate(inst_id)
                     funding_change_pct = None
                     if prev_funding is not None and funding_pct is not None:
                         funding_change_pct = funding_pct - (prev_funding * 100)
 
-                    # YENI (Madde 5): Spot CVD -- sadece gonderilecek adaylar
-                    # icin cekiliyor (gereksiz API yukunu onlemek adina).
                     try:
                         spot_cvd_ratio = get_spot_cvd_buy_ratio(inst_id)
                     except Exception as e:
@@ -1627,8 +1495,7 @@ def run_scanner():
                     base_symbol = inst_id.replace("USDT", "").strip().upper()
                     is_trending = base_symbol in trending_symbols
                     if is_trending:
-                        yorum += (" 🔥 Ayrica CoinGecko'nun Trending (en cok aranan) listesinde de var -- "
-                                  "hem hacim hem genel arama ilgisi ayni anda yukseliyor, capraz teyit guclu.")
+                        yorum += (" 🔥 Ayrica CoinGecko'nun Trending listesinde.")
 
                     obs_data["yorum"] = yorum
                     obs_data["notified"] = 1
@@ -1644,6 +1511,7 @@ def run_scanner():
                         "freshness": freshness_ratio,
                         "oi_change_pct": oi_change_pct,
                         "cvd_ratio": cvd_ratio,
+                        "funding_pct": funding_pct,
                         "yorum": yorum,
                     })
 
@@ -1652,6 +1520,9 @@ def run_scanner():
         except Exception as e:
             logging.error(f"Hata ({t.get('symbol')}): {e}")
 
+    # =========================================================================
+    # DÜZELTME 2: TÜM VERİLERİ İÇEREN TEK TELEGRAM MESAJ KARTI
+    # =========================================================================
     if alerts_to_send:
         msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
         for a in alerts_to_send:
@@ -1659,27 +1530,28 @@ def run_scanner():
             msg += f"{direction} *{a['inst_id']}*\n"
 
             fi = a.get("freshness_info", {})
-            label = fi.get("label", "BELIRSIZ")
+            label = fi.get("label", "")
             if label == "TAZE":
                 msg += "🟢 *TAZE* -- erken asamada, potansiyel devam edebilir\n"
             elif label == "UZAMIS":
                 msg += "🔴 *UZAMIS* -- zaten isinmis, tukenme riski yuksek olabilir\n"
-            else:
-                msg += "⚪ *BELIRSIZ* -- taze/uzamis ayrimi icin yeterli veri yok\n"
+            
             if fi.get("aciklama"):
                 msg += f"   _{fi['aciklama']}_\n"
 
             msg += f"• Fiyat: `{a['price']}`\n"
             msg += f"• 24s Değişim: `%{a['change']:.2f}`\n"
             msg += f"• 24s Ciro: `{a['turnover']:,.0f} USDT`\n"
-            vr_str = f"{a['volume_ratio']:.2f}x" if a["volume_ratio"] is not None else "n/a (yeterli gecmis yok)"
-            msg += f"• Hacim Orani (normale gore): `{vr_str}`\n"
+            vr_str = f"{a['volume_ratio']:.2f}x" if a["volume_ratio"] is not None else "n/a"
+            msg += f"• Hacim Orani: `{vr_str}`\n"
             msg += f"• Hacim İvmesi (kisa vade): `{a['freshness']:.2f}x`\n"
             if a["oi_change_pct"] is not None:
                 msg += f"• OI Değişimi (24s): `%{a['oi_change_pct']:.1f}`\n"
             if a["cvd_ratio"] is not None:
                 msg += f"• Alış Oranı (CVD): `%{a['cvd_ratio']*100:.0f}`\n"
-            score_str = f"{a['score']:.1f}" if a["score"] is not None else "n/a (BUYUK HAREKET yolu ile geldi)"
+            if a["funding_pct"] is not None:
+                msg += f"• Funding Rate: `%{a['funding_pct']:.3f}`\n"
+            score_str = f"{a['score']:.1f}" if a["score"] is not None else "n/a"
             msg += f"• *Final Skor:* `{score_str}`\n"
             msg += f"📝 _{a['yorum']}_\n\n"
 
@@ -1692,7 +1564,7 @@ def run_scanner():
         logging.info("📊 Şu Anki En Yüksek Skorlu 5 Coin:")
         for c in top_candidates:
             oi_str = f"{c['oi_change_pct']:.1f}%" if c.get("oi_change_pct") is not None else "n/a"
-            score_str = f"{c['final_score']:.2f}" if c["final_score"] is not None else "n/a (yeterli gecmis yok)"
+            score_str = f"{c['final_score']:.2f}" if c["final_score"] is not None else "n/a"
             vr_str = f"{c['volume_ratio']:.2f}x" if c.get("volume_ratio") is not None else "n/a"
             logging.info(
                 f"   -> {c['inst_id']:<18} | Değişim: %{c['change_24h_pct']:<6.2f} | "
