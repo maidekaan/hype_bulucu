@@ -642,6 +642,21 @@ FUNDING_HISTORY_LOOKBACK_HOURS = 6.0  # "son 4-8 saatteki degisim" icin kullanil
 STRONG_SETUP_RSI_MAX = 60.0
 STRONG_SETUP_CVD_MIN = 0.65
 
+# --- YENI: OI Coklu Zaman Dilimi Teyidi (Burakcan'in notuna gore) ---
+# Scalp/gun ici olcek: 15dk/1sa'da OI degisimi %5-15 arasi 'onemli' sayilir.
+# Swing/trend olcegi: 4sa/1gun'de OI degisimi %30+ 'onemli' sayilir.
+# Ikisinden BIRI yeterli -- coin'in 'scalp' mi 'swing' mi bir hareket
+# icinde oldugunu ayirt eder.
+OI_SCALP_MIN_PCT = 5.0
+OI_SCALP_MAX_PCT = 15.0
+OI_SWING_MIN_PCT = 30.0
+
+# --- YENI: Ana "Giris Firsati" kapisi -- ARTIK ana hype sinyali icin
+# ZORUNLU sartlar (sadece bilgi/vurgu degil). Kararlastirildigi gibi bu,
+# sistemi LONG/al firsatlarina odaklaniyor.
+ENTRY_GATE_RSI_MAX = STRONG_SETUP_RSI_MAX
+ENTRY_GATE_CVD_MIN = STRONG_SETUP_CVD_MIN
+
 # --- YENI (Madde 6): Funding asiriligi bazli AYRI, paralel bir tarama ---
 FUNDING_SCAN_EXTREME_PCT = 0.05          # bu yuzdenin uzerindeki/altindaki funding 'asiri' sayilir
 FUNDING_SCAN_MIN_PRICE_MOVE_PCT = 10.0    # fiyat da bu kadar hareket etmis olmali
@@ -790,6 +805,73 @@ def get_previous_oi(inst_id: str):
     row = cursor.fetchone()
     conn.close()
     return row[0] if row and row[0] else None
+
+
+def get_oi_at_least_hours_ago(inst_id: str, hours_ago: float):
+    """
+    YENI: get_previous_oi'nin genellestirilmis hali -- herhangi bir saat
+    onceki OI degerini bulur (en az 'hours_ago' kadar eski, en yakin kayit).
+    OI coklu zaman dilimi teyidi (Madde: scalp/swing ayrimi) icin kullanilir.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    row = conn.execute(
+        """
+        SELECT oi_value FROM hype_observations
+        WHERE inst_id = ? AND oi_value IS NOT NULL AND timestamp <= ?
+        ORDER BY timestamp DESC LIMIT 1
+        """,
+        (inst_id, cutoff),
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def check_oi_multiframe_confirmation(inst_id: str, current_oi):
+    """
+    YENI: Burakcan'in notuna gore -- OI degisimini islem tarzina uygun
+    zaman diliminde degerlendirir:
+      - Scalp/gun ici: 1 saatlik OI degisimi %5-15 arasindaysa teyit sayilir.
+      - Swing/trend: 4 saatlik OI degisimi %30+ ise teyit sayilir.
+    Ikisinden BIRI yeterli. Hicbiri saglanmiyorsa 'passed': False doner.
+
+    Donus: {'passed': bool, 'scale': 'scalp'/'swing'/None, 'detail': str}
+    """
+    if current_oi is None:
+        return {"passed": False, "scale": None, "detail": "Guncel OI verisi yok."}
+
+    oi_1h_ago = get_oi_at_least_hours_ago(inst_id, 1.0)
+    oi_4h_ago = get_oi_at_least_hours_ago(inst_id, 4.0)
+
+    scalp_change = None
+    if oi_1h_ago and oi_1h_ago > 0:
+        scalp_change = (current_oi - oi_1h_ago) / oi_1h_ago * 100.0
+
+    swing_change = None
+    if oi_4h_ago and oi_4h_ago > 0:
+        swing_change = (current_oi - oi_4h_ago) / oi_4h_ago * 100.0
+
+    scalp_ok = scalp_change is not None and OI_SCALP_MIN_PCT <= scalp_change <= OI_SCALP_MAX_PCT
+    swing_ok = swing_change is not None and swing_change >= OI_SWING_MIN_PCT
+
+    if scalp_ok:
+        return {
+            "passed": True, "scale": "scalp",
+            "detail": f"1sa OI degisimi %{scalp_change:.1f} (scalp araligi %{OI_SCALP_MIN_PCT:.0f}-{OI_SCALP_MAX_PCT:.0f})",
+        }
+    if swing_ok:
+        return {
+            "passed": True, "scale": "swing",
+            "detail": f"4sa OI degisimi %{swing_change:.1f} (swing esigi %{OI_SWING_MIN_PCT:.0f}+)",
+        }
+
+    parts = []
+    if scalp_change is not None:
+        parts.append(f"1sa: %{scalp_change:.1f}")
+    if swing_change is not None:
+        parts.append(f"4sa: %{swing_change:.1f}")
+    detail = "OI coklu-zaman-dilimi teyidi yok" + (f" ({', '.join(parts)})" if parts else " (yeterli gecmis yok)")
+    return {"passed": False, "scale": None, "detail": detail}
 
 
 def get_previous_funding_rate(inst_id: str, hours_ago: float = FUNDING_HISTORY_LOOKBACK_HOURS):
@@ -1257,6 +1339,32 @@ def get_cvd_buy_ratio(inst_id: str, limit: int = 300):
         return None
 
 
+def compute_multi_timeframe_technicals(inst_id: str):
+    """
+    YENI: 15dk / 1sa / 4sa mumlarla RSI ve MACD hesaplar -- bilgilendirici
+    amaclidir, giris kapisini ETKILEMEZ, sadece kapiyi gecen sinyalin
+    mesajina eklenen detayli bir teknik ozet saglar.
+
+    Donus: {'15dk': {'rsi':.., 'macd_hist':..}, '1sa': {...}, '4sa': {...}}
+    Herhangi bir zaman dilimi icin veri yetersizse o dilimin degerleri
+    None kalir (hata firlatmaz).
+    """
+    result = {}
+    for tf_key, interval, limit in [("15dk", "15", 100), ("1sa", "60", 100), ("4sa", "240", 100)]:
+        bars = fetch_klines_generic(inst_id, interval=interval, limit=limit)
+        if bars is None or len(bars) < 35:
+            result[tf_key] = {"rsi": None, "macd_hist": None}
+            continue
+        closes = [b["close"] for b in bars]
+        rsi = calculate_rsi(closes, period=14)
+        macd = calculate_macd(closes)
+        result[tf_key] = {
+            "rsi": rsi,
+            "macd_hist": macd["histogram"] if macd else None,
+        }
+    return result
+
+
 def get_spot_cvd_buy_ratio(inst_id: str, limit: int = 300):
     """
     YENI (Madde 5): Ayni hesaplamayi SPOT piyasa icin yapar (category='spot').
@@ -1575,9 +1683,14 @@ def run_scanner():
             )
             big_move_path_passed = abs(change_24h_pct) >= BIG_MOVE_PRICE_CHANGE_PCT
 
+            # NOT: score_path/big_move_path artik SADECE ucuz bir ON-FILTRE --
+            # hangi adaylar icin pahali (CVD, coklu zaman dilimi vb.) hesaplama
+            # yapilacagini belirliyor. Asil GONDERIM KARARI, asagidaki YENI
+            # ZORUNLU KAPI tarafindan veriliyor.
             should_notify_preliminary = (
                 (score_path_passed or big_move_path_passed)
                 and not is_recently_notified(inst_id)
+                and change_24h_pct >= 0  # YENI: sadece YUKSELIS yonu (Burakcan'in RSI<60+CVD>65 kurali long icin)
             )
 
             if should_notify_preliminary:
@@ -1591,37 +1704,55 @@ def run_scanner():
                     freshness_info = {"label": "BELIRSIZ", "short_rsi": None,
                                        "breakout_age_minutes": None, "aciklama": "Hesaplanamadi."}
 
-                # YENI (Madde 1): RSI asiri + eski hareket + CVD uyumsuzlugu
-                # varsa -- bu "cikis/tersine donus" bolgesi, TAMAMEN BASTIR.
-                suppress_exhausted = is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
+                short_rsi = freshness_info.get("short_rsi")
 
-                # YENI (Madde 2): OI verisi yoksa (hesaplanamiyorsa) bastir.
-                suppress_no_oi = oi_change_pct is None
+                # --- YENI ZORUNLU GIRIS KAPISI ---
+                # Burakcan'in notuna gore: RSI < 60 (henuz asiri isinmamis)
+                # VE CVD > 65 (guclu, net alis baskisi) ZORUNLU. Ayrica
+                # tukenme/ters donus bolgesinde DEGIL VE OI, scalp ya da
+                # swing olceginde teyit ediyor olmali.
+                rsi_gate_passed = short_rsi is not None and short_rsi < ENTRY_GATE_RSI_MAX
+                cvd_gate_passed = cvd_ratio is not None and cvd_ratio > ENTRY_GATE_CVD_MIN
+                not_exhausted = not is_exhausted_reversal_zone(change_24h_pct, freshness_info, cvd_ratio)
+                oi_multiframe = check_oi_multiframe_confirmation(inst_id, current_oi)
 
-                if suppress_exhausted:
-                    logging.info(f"[Bastirma] {inst_id}: tukenme/ters donus bolgesinde, sinyal bastirildi.")
-                elif suppress_no_oi:
-                    logging.info(f"[Bastirma] {inst_id}: OI verisi yok, sinyal bastirildi.")
+                gate_passed = rsi_gate_passed and cvd_gate_passed and not_exhausted and oi_multiframe["passed"]
+
+                if not gate_passed:
+                    reasons = []
+                    if not rsi_gate_passed:
+                        reasons.append(f"RSI kapisi gecmedi ({short_rsi})")
+                    if not cvd_gate_passed:
+                        reasons.append(f"CVD kapisi gecmedi ({cvd_ratio})")
+                    if not not_exhausted:
+                        reasons.append("tukenme/ters donus bolgesinde")
+                    if not oi_multiframe["passed"]:
+                        reasons.append(f"OI teyidi yok ({oi_multiframe['detail']})")
+                    logging.info(f"[Kapi Reddi] {inst_id}: {' | '.join(reasons)}")
                 else:
-                    # YENI (Madde 3): funding degisimi (son ~6 saat).
+                    # YENI: funding degisimi (son ~6 saat) -- bilgilendirici.
                     prev_funding = get_previous_funding_rate(inst_id)
                     funding_change_pct = None
                     if prev_funding is not None and funding_pct is not None:
                         funding_change_pct = funding_pct - (prev_funding * 100)
 
-                    # YENI (Madde 5): Spot CVD -- sadece gonderilecek adaylar
-                    # icin cekiliyor (gereksiz API yukunu onlemek adina).
                     try:
                         spot_cvd_ratio = get_spot_cvd_buy_ratio(inst_id)
                     except Exception as e:
                         logging.error(f"{inst_id} Spot CVD tespiti hatasi: {e}")
                         spot_cvd_ratio = None
 
+                    try:
+                        mtf = compute_multi_timeframe_technicals(inst_id)
+                    except Exception as e:
+                        logging.error(f"{inst_id} coklu zaman dilimi analizi hatasi: {e}")
+                        mtf = None
+
                     yorum = generate_commentary(
                         change_24h_pct, oi_change_pct, cvd_ratio, position_in_range, freshness_ratio,
                         funding_pct=funding_pct, funding_change_pct=funding_change_pct,
                         spot_cvd_ratio=spot_cvd_ratio, freshness_label=freshness_info.get("label"),
-                        short_rsi=freshness_info.get("short_rsi"),
+                        short_rsi=short_rsi,
                     )
 
                     base_symbol = inst_id.replace("USDT", "").strip().upper()
@@ -1643,7 +1774,11 @@ def run_scanner():
                         "volume_ratio": volume_ratio,
                         "freshness": freshness_ratio,
                         "oi_change_pct": oi_change_pct,
+                        "oi_multiframe": oi_multiframe,
                         "cvd_ratio": cvd_ratio,
+                        "spot_cvd_ratio": spot_cvd_ratio,
+                        "funding_pct": funding_pct,
+                        "mtf": mtf,
                         "yorum": yorum,
                     })
 
@@ -1653,17 +1788,16 @@ def run_scanner():
             logging.error(f"Hata ({t.get('symbol')}): {e}")
 
     if alerts_to_send:
-        msg = "🚀 *HYPE SINYALI TESPIT EDILDI!*\n\n"
+        msg = "🎯 *GIRIS FIRSATI TESPIT EDILDI!*\n_(RSI<60 + CVD>65 + OI teyidi -- kapiyi gecen sinyaller)_\n\n"
         for a in alerts_to_send:
-            direction = "🟢" if a["change"] >= 0 else "🔴"
-            msg += f"{direction} *{a['inst_id']}*\n"
+            msg += f"🟢 *{a['inst_id']}*\n"
 
             fi = a.get("freshness_info", {})
             label = fi.get("label", "BELIRSIZ")
             if label == "TAZE":
                 msg += "🟢 *TAZE* -- erken asamada, potansiyel devam edebilir\n"
             elif label == "UZAMIS":
-                msg += "🔴 *UZAMIS* -- zaten isinmis, tukenme riski yuksek olabilir\n"
+                msg += "🟡 *UZAMIS ama CVD teyit ediyor* -- dikkatli takip et\n"
             else:
                 msg += "⚪ *BELIRSIZ* -- taze/uzamis ayrimi icin yeterli veri yok\n"
             if fi.get("aciklama"):
@@ -1675,10 +1809,36 @@ def run_scanner():
             vr_str = f"{a['volume_ratio']:.2f}x" if a["volume_ratio"] is not None else "n/a (yeterli gecmis yok)"
             msg += f"• Hacim Orani (normale gore): `{vr_str}`\n"
             msg += f"• Hacim İvmesi (kisa vade): `{a['freshness']:.2f}x`\n"
+
+            # YENI: OI coklu zaman dilimi detayi (scalp/swing).
+            oi_mf = a.get("oi_multiframe")
+            if oi_mf and oi_mf.get("detail"):
+                scale_text = {"scalp": "SCALP olcek", "swing": "SWING olcek"}.get(oi_mf.get("scale"), "")
+                msg += f"• OI Teyidi ({scale_text}): `{oi_mf['detail']}`\n"
             if a["oi_change_pct"] is not None:
-                msg += f"• OI Değişimi (24s): `%{a['oi_change_pct']:.1f}`\n"
+                msg += f"• OI Değişimi (24s, referans): `%{a['oi_change_pct']:.1f}`\n"
+
             if a["cvd_ratio"] is not None:
-                msg += f"• Alış Oranı (CVD): `%{a['cvd_ratio']*100:.0f}`\n"
+                msg += f"• Futures CVD: `%{a['cvd_ratio']*100:.0f}`\n"
+            if a.get("spot_cvd_ratio") is not None:
+                msg += f"• Spot CVD: `%{a['spot_cvd_ratio']*100:.0f}`\n"
+            if a.get("funding_pct") is not None:
+                msg += f"• Funding: `%{a['funding_pct']:.3f}`\n"
+
+            # YENI: Coklu zaman dilimi RSI/MACD ozeti (15dk/1sa/4sa).
+            mtf = a.get("mtf")
+            if mtf:
+                parts = []
+                for tf_key in ["15dk", "1sa", "4sa"]:
+                    tf = mtf.get(tf_key, {})
+                    rsi_v = tf.get("rsi")
+                    macd_v = tf.get("macd_hist")
+                    rsi_str = f"{rsi_v:.0f}" if rsi_v is not None else "n/a"
+                    macd_str = ("+" if (macd_v is not None and macd_v > 0) else
+                                "-" if (macd_v is not None and macd_v < 0) else "n/a")
+                    parts.append(f"{tf_key} RSI {rsi_str}/MACD{macd_str}")
+                msg += f"• Coklu Zaman Dilimi: `{' | '.join(parts)}`\n"
+
             score_str = f"{a['score']:.1f}" if a["score"] is not None else "n/a (BUYUK HAREKET yolu ile geldi)"
             msg += f"• *Final Skor:* `{score_str}`\n"
             msg += f"📝 _{a['yorum']}_\n\n"
